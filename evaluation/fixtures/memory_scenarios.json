@@ -1,0 +1,152 @@
+{
+  "version": "review-1.0",
+  "source": "synthetic_anonymized",
+  "scenarios": [
+    {
+      "id": "M001",
+      "type": "working_memory",
+      "turns": ["我要报销上周去杭州的高铁票", "票价是326元，订单号是 TR-260901", "需要上传什么材料？"],
+      "final_query": "请总结我这笔报销的已知信息",
+      "must_recall": ["杭州", "326", "TR-260901"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M002",
+      "type": "working_memory",
+      "turns": ["我的企业邮箱无法登录", "页面提示401，今天上午9点第一次出现", "我使用的是公司 WiFi"],
+      "final_query": "帮我整理提交 IT 工单时已知的故障信息",
+      "must_recall": ["401", "上午9点", "公司 WiFi"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M003",
+      "type": "working_memory",
+      "turns": ["我要申请测试服务器权限", "项目名称是 Atlas，预计使用到12月底", "直属主管是陈经理"],
+      "final_query": "申请信息里还记得哪些关键内容？",
+      "must_recall": ["Atlas", "12月底", "陈经理"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M004",
+      "type": "working_memory",
+      "turns": ["我下午要开产品评审会", "会议室是 A302，时间是14:00到15:30", "参会人数12人"],
+      "final_query": "请确认这次会议的时间、地点和人数",
+      "must_recall": ["A302", "14:00", "15:30", "12"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M005",
+      "type": "working_memory",
+      "turns": ["我的报销被退回", "单号是 BX-202609-055", "退回原因为缺少酒店发票"],
+      "final_query": "我下一步要补什么材料？请带上报销单号",
+      "must_recall": ["BX-202609-055", "酒店发票"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M006",
+      "type": "working_memory",
+      "turns": ["我要更新手机号", "旧号码尾号为1188，新号码尾号为6620", "更新后还要重新绑定认证器吗？"],
+      "final_query": "请根据前面的信息说明我要做什么",
+      "must_recall": ["1188", "6620", "认证器"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M007",
+      "type": "episodic_memory",
+      "session_1": ["我上月在深圳出差三天", "住宿总额为1680元，报销单号是 BX-SZ-0901", "其中一晚超出住宿标准，已取得主管审批"],
+      "session_2_query": "继续查询上次深圳出差报销的注意事项",
+      "must_recall": ["深圳", "1680", "BX-SZ-0901", "主管审批"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M008",
+      "type": "episodic_memory",
+      "session_1": ["我的笔记本电脑资产编号是 IT-8832", "键盘进水后无法开机", "我在周二上午已提交报修"],
+      "session_2_query": "帮我跟进之前的电脑报修，并说明设备编号",
+      "must_recall": ["IT-8832", "键盘进水", "周二上午"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M009",
+      "type": "episodic_memory",
+      "session_1": ["我加入了 Orion 项目", "需要申请代码仓库和测试环境权限", "项目负责人是李工"],
+      "session_2_query": "我之前申请的是什么项目权限，负责人是谁？",
+      "must_recall": ["Orion", "代码仓库", "测试环境", "李工"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M010",
+      "type": "episodic_memory",
+      "session_1": ["上周我修改过企业邮箱密码", "现在新密码登录仍提示401", "我在家里网络下使用 VPN"],
+      "session_2_query": "上次登录失败的错误是什么，网络环境是什么？",
+      "must_recall": ["401", "家里网络", "VPN"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M011",
+      "type": "episodic_memory",
+      "session_1": ["我参加了上海客户交流会", "餐费发票金额为268元", "参会人员包括客户王女士和同事赵明"],
+      "session_2_query": "上次餐费报销金额及需要说明的人员有哪些？",
+      "must_recall": ["268", "王女士", "赵明"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M012",
+      "type": "episodic_memory",
+      "session_1": ["我申请了A302会议室", "会议主题是年度预算评审", "定在周五14点，预计12人参加"],
+      "session_2_query": "帮我确认周五预订的会议室和会议主题",
+      "must_recall": ["A302", "年度预算评审", "周五14点"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M013",
+      "type": "summary_compression",
+      "turns": ["我要处理出差报销", "出差地点是广州", "出差日期为9月1日至9月3日", "交通费是580元", "住宿费是1200元", "报销单号 BX-GZ-0903", "直属主管已经审批", "酒店发票已上传", "高铁票已上传", "系统提示需要补充业务事由", "业务事由是客户项目现场支持", "我预计明天重新提交", "请问付款日是周几？", "我还需要做什么？", "谢谢"],
+      "final_query": "对话压缩后，请列出本次报销不可遗漏的关键信息",
+      "must_recall": ["广州", "9月1日至9月3日", "580", "1200", "BX-GZ-0903", "客户项目现场支持"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M014",
+      "type": "summary_compression",
+      "turns": ["我无法登录门户", "错误码是401", "今天8点半开始出现", "使用公司 WiFi", "浏览器是 Chrome", "我已经清理过缓存", "重新登录过两次", "密码昨天刚重置", "VPN 也无法连接", "项目是 Apollo", "影响我提交早会材料", "我有报错截图", "准备提交IT工单", "需要写哪些信息？", "请帮我总结"],
+      "final_query": "压缩后请输出 IT 工单中的关键故障信息",
+      "must_recall": ["401", "8点半", "公司 WiFi", "Chrome", "Apollo", "报错截图"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M015",
+      "type": "summary_compression",
+      "turns": ["我要申请额外显示器", "我是新员工", "部门是产品部", "项目是 Nova", "用途是数据看板测试", "预计使用6个月", "直属主管是周经理", "办公地点上海", "已有一台笔记本", "需要一台27寸显示器", "资产编号暂时没有", "明天提交申请", "是否需要说明归还日期？", "请总结申请信息", "谢谢"],
+      "final_query": "压缩后，申请额外显示器时应保留哪些已知信息？",
+      "must_recall": ["产品部", "Nova", "数据看板测试", "6个月", "周经理", "上海", "27寸显示器"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M016",
+      "type": "user_isolation",
+      "user_a": ["我是用户A，我的报销单号是 BX-A-001，金额500元"],
+      "user_b": ["我是用户B，我的报销单号是 BX-B-002，金额800元"],
+      "query_as": "user_b",
+      "final_query": "请告诉我我自己的报销单号和金额",
+      "must_recall": ["BX-B-002", "800"],
+      "must_not_recall": ["BX-A-001", "500"]
+    },
+    {
+      "id": "M017",
+      "type": "user_profile",
+      "turns": ["我在财务部工作", "我经常处理差旅报销", "办公地点在上海", "我更希望收到步骤清晰的操作说明"],
+      "final_query": "请概括可长期保留的用户偏好与背景",
+      "must_recall": ["财务部", "差旅报销", "上海", "步骤清晰"],
+      "must_not_recall": []
+    },
+    {
+      "id": "M018",
+      "type": "negative_retrieval",
+      "history": ["我曾在北京出差，报销单号 BX-BJ-001", "我曾申请过 Orion 项目权限"],
+      "final_query": "请说明火星基地的差旅补贴标准",
+      "must_recall": [],
+      "must_not_recall": ["BX-BJ-001", "Orion"]
+    }
+  ]
+}
