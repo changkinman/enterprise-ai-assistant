@@ -1,7 +1,6 @@
 """Deterministic case workflow around governed reimbursement tools."""
 
 import asyncio
-from dataclasses import asdict
 from copy import deepcopy
 import math
 from typing import Any
@@ -268,9 +267,31 @@ class ReimbursementCaseHarness:
         case = await self.repository.get_case(case_id)
         if case is None:
             return None
-        data = asdict(case)
-        data["state"] = case.state.value
-        return data
+        amounts = [item.get("amount") for item in case.expenses if isinstance(item, dict)]
+        total_amount = sum(
+            amount for amount in amounts
+            if isinstance(amount, (int, float)) and not isinstance(amount, bool)
+            and math.isfinite(amount) and amount > 0
+        )
+        validation = case.validation
+        issues = validation.get("issues")
+        return {
+            "case_id": case.case_id,
+            "state": case.state.value,
+            "claim_no": case.claim_no,
+            "total_amount": total_amount,
+            "validation_summary": {
+                "valid": validation.get("valid") if isinstance(validation.get("valid"), bool) else None,
+                "issue_count": len(issues) if isinstance(issues, list) else 0,
+                "review_approved": validation.get("review_approved") is True,
+            },
+            "budget_reserved": case.budget_reserved,
+            "version": case.version,
+            "events": [
+                {"at": event.at, "version": event.version, "event_type": event.event_type}
+                for event in case.events
+            ],
+        }
 
     async def review_claim(self, case_id: str, reviewer_id: str, approved: bool,
                            comment: str = "") -> dict[str, Any]:

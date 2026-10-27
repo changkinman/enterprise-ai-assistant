@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from api import main as api
 from core.reimbursement_harness import ReimbursementCaseHarness
-from core.reimbursement_models import ClaimState, ReimbursementCase
+from core.reimbursement_models import ClaimState, ReimbursementCase, append_event
 from core.reimbursement_repository import InMemoryReimbursementRepository
 from mcp.tool_manager import MCPToolManager
 from tools.loader import discover_agent_tools
@@ -39,6 +39,30 @@ class ReimbursementApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["case_id"], "CASE-1")
         self.assertEqual(payload["state"], "collecting_info")
         json.dumps(payload)
+
+    async def test_get_case_excludes_sensitive_case_and_event_details(self):
+        case = ReimbursementCase("CASE-1", "private-user", "private-conversation")
+        case.facts = {"trip_city": "private-city"}
+        case.expenses = [{"type": "private-expense", "amount": 100}]
+        case.validation = {"valid": True, "total_amount": 100,
+                           "issues": [], "private_rule": "private-validation"}
+        append_event(case, "facts_updated", {"note": "private-event"})
+        await self.repository.save_case(case)
+
+        payload = await api.get_reimbursement_case("CASE-1")
+        self.assertEqual(
+            set(payload),
+            {"case_id", "state", "claim_no", "total_amount", "validation_summary",
+             "budget_reserved", "version", "events"},
+        )
+        self.assertEqual(payload["total_amount"], 100)
+        self.assertEqual(payload["validation_summary"],
+                         {"valid": True, "issue_count": 0, "review_approved": False})
+        self.assertEqual(set(payload["events"][0]), {"at", "version", "event_type"})
+        serialized = json.dumps(payload)
+        for secret in ("private-user", "private-conversation", "private-city",
+                       "private-expense", "private-validation", "private-event"):
+            self.assertNotIn(secret, serialized)
 
     async def test_get_missing_case_returns_404(self):
         with self.assertRaises(HTTPException) as caught:
