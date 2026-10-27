@@ -202,7 +202,7 @@ class MCPToolManager:
 
         # 缓存命中
         if use_cache and tool.cache_ttl > 0:
-            cached = self._get_cache(name, params)
+            cached = self._get_cache(name, params, context)
             if cached is not None:
                 tool.stats.total += 1
                 tool.stats.success += 1
@@ -229,7 +229,7 @@ class MCPToolManager:
 
             # 写缓存
             if tool.cache_ttl > 0:
-                self._set_cache(name, params, data, tool.cache_ttl)
+                self._set_cache(name, params, data, tool.cache_ttl, context)
 
             # 重排（针对返回列表的检索工具）
             reranked = False
@@ -393,11 +393,15 @@ class MCPToolManager:
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 
-    def _cache_key(self, name: str, params: Dict) -> str:
-        return f"{name}:{hashlib.md5(json.dumps(params, sort_keys=True).encode()).hexdigest()}"
+    def _cache_key(self, name: str, params: Dict, context: Optional[Dict] = None) -> str:
+        payload = json.dumps(params, sort_keys=True)
+        if context is not None:
+            identity = {"user_id": context.get("user_id"), "conv_id": context.get("conv_id")}
+            payload += ":" + json.dumps(identity, sort_keys=True)
+        return f"{name}:{hashlib.md5(payload.encode()).hexdigest()}"
 
-    def _get_cache(self, name: str, params: Dict) -> Optional[Any]:
-        key = self._cache_key(name, params)
+    def _get_cache(self, name: str, params: Dict, context: Optional[Dict] = None) -> Optional[Any]:
+        key = self._cache_key(name, params, context)
         if key in self._cache:
             data, expire_at = self._cache[key]
             if time.monotonic() < expire_at:
@@ -405,12 +409,13 @@ class MCPToolManager:
             del self._cache[key]
         return None
 
-    def _set_cache(self, name: str, params: Dict, data: Any, ttl: float) -> None:
+    def _set_cache(self, name: str, params: Dict, data: Any, ttl: float,
+                   context: Optional[Dict] = None) -> None:
         if len(self._cache) >= 5000:
             # 清掉最旧的 1/4
             for k in list(self._cache)[:1250]:
                 del self._cache[k]
-        self._cache[self._cache_key(name, params)] = (data, time.monotonic() + ttl)
+        self._cache[self._cache_key(name, params, context)] = (data, time.monotonic() + ttl)
 
     # ── 参数校验 ──────────────────────────────────────────────────────────────
 

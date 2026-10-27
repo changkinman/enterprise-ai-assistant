@@ -1,4 +1,5 @@
 import asyncio
+import math
 import sys
 import unittest
 from types import SimpleNamespace
@@ -7,7 +8,7 @@ sys.modules.setdefault("anthropic", SimpleNamespace(AsyncAnthropic=lambda **_: N
 
 from core.reimbursement_models import ClaimState
 from core.reimbursement_repository import InMemoryReimbursementRepository
-from mcp.tool_manager import MCPToolManager
+from mcp.tool_manager import MCPToolManager, Tool
 from tools.loader import discover_agent_tools
 
 
@@ -107,6 +108,95 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
         first, second = await asyncio.gather(submit("a"), submit("b"))
         self.assertEqual(sum((first.success, second.success)), 1)
         self.assertEqual(await self.repo.remaining_budget("engineering"), 2200.0)
+
+    async def test_cached_case_and_budget_do_not_cross_trusted_identity(self):
+        case = await self.ready_case()
+        for name in ("get_case", "check_budget"):
+            first = await self.call(name, {"case_id": case.case_id})
+            other_user = await self.call(name, {"case_id": case.case_id},
+                                         {"user_id": "other", "conv_id": "conv-1"})
+            other_conversation = await self.call(name, {"case_id": case.case_id},
+                                                 {"user_id": "emp-001", "conv_id": "other"})
+            self.assertTrue(first.success)
+            self.assertFalse(other_user.success)
+            self.assertFalse(other_conversation.success)
+
+    async def test_rejection_refunds_once_and_new_submission_reserves_once(self):
+        case = await self.ready_case()
+        submit_context = {**CONTEXT, "confirmed": True}
+        first = await self.call("submit_claim", {"case_id": case.case_id, "idempotency_key": "first"}, submit_context)
+        self.assertTrue(first.success)
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 2200.0)
+        reviewer = {"user_id": "manager-001", "conv_id": "conv-1"}
+        rejected = await self.call("review_claim", {"case_id": case.case_id, "approved": False}, reviewer)
+        duplicate = await self.call("review_claim", {"case_id": case.case_id, "approved": False}, reviewer)
+        self.assertTrue(rejected.success)
+        self.assertFalse(duplicate.success)
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 3000.0)
+        self.assertFalse((await self.repo.get_case(case.case_id)).budget_reserved)
+        validated = await self.call("validate_claim", {"case_id": case.case_id})
+        self.assertTrue(validated.data["valid"])
+        second = await self.call("submit_claim", {"case_id": case.case_id, "idempotency_key": "second"}, submit_context)
+        self.assertTrue(second.success)
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 2200.0)
+        self.assertNotEqual(first.data["claim_no"], second.data["claim_no"])
+
+    async def test_nonfinite_expenses_cannot_change_budget(self):
+        for amount in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(amount=amount):
+                repo = InMemoryReimbursementRepository(budgets={"engineering": 3000.0})
+                manager = MCPToolManager(api_key="test")
+                discover_agent_tools(manager, dependencies={"reimbursement_repository": repo})
+                case = await repo.get_or_create_active_case("emp-001", "conv-1")
+                case.state = ClaimState.AWAITING_CONFIRMATION
+                case.facts = {"trip_city": "上海", "trip_date": "2026-10-20", "project_code": "P1"}
+                case.expenses = [{"type": "transport", "amount": amount}]
+                await repo.save_case(case)
+                validation = await manager.call("validate_claim", {"case_id": case.case_id}, CONTEXT, caller_agent="billing")
+                self.assertFalse(validation.data["valid"])
+                self.assertIn("invalid_amount", [issue["code"] for issue in validation.data["issues"]])
+                submission = await manager.call("submit_claim", {"case_id": case.case_id, "idempotency_key": "x"},
+                                                {**CONTEXT, "confirmed": True}, caller_agent="billing")
+                self.assertFalse(submission.success)
+                self.assertTrue(math.isfinite(await repo.remaining_budget("engineering")))
+                self.assertEqual(await repo.remaining_budget("engineering"), 3000.0)
+
+    async def test_repository_rejects_nonfinite_validator_amount(self):
+        case = await self.ready_case()
+        for amount in (float("nan"), float("inf")):
+            with self.subTest(amount=amount):
+                with self.assertRaises(ValueError):
+                    await self.repo.submit_claim(case.case_id, str(amount), "emp-001", "conv-1",
+                                                 lambda _: {"valid": True, "required_budget": amount})
+                self.assertEqual(await self.repo.remaining_budget("engineering"), 3000.0)
+
+
+class CacheContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_context_identity_scopes_cache_and_absent_context_still_hits(self):
+        manager = MCPToolManager(api_key="test")
+        calls = 0
+
+        async def handler(params, context):
+            nonlocal calls
+            calls += 1
+            return {"caller": (context or {}).get("user_id"), "call": calls}
+
+        manager.register(Tool("identity_probe", "identity cache probe", handler,
+                              {"type": "object", "properties": {}, "required": []},
+                              cache_ttl=60, allowed_agents=frozenset({"billing"})))
+        first = await manager.call("identity_probe", {}, {"user_id": "a", "conv_id": "1"}, caller_agent="billing")
+        same = await manager.call("identity_probe", {}, {"user_id": "a", "conv_id": "1"}, caller_agent="billing")
+        other_user = await manager.call("identity_probe", {}, {"user_id": "b", "conv_id": "1"}, caller_agent="billing")
+        other_conv = await manager.call("identity_probe", {}, {"user_id": "a", "conv_id": "2"}, caller_agent="billing")
+        absent = await manager.call("identity_probe", {}, caller_agent="billing")
+        absent_again = await manager.call("identity_probe", {}, caller_agent="billing")
+        self.assertFalse(first.cached)
+        self.assertTrue(same.cached)
+        self.assertFalse(other_user.cached)
+        self.assertFalse(other_conv.cached)
+        self.assertFalse(absent.cached)
+        self.assertTrue(absent_again.cached)
+        self.assertEqual(calls, 4)
 
 
 if __name__ == "__main__":

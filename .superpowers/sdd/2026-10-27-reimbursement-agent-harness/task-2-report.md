@@ -28,3 +28,21 @@ The first sandboxed asyncio unittest command hung after printing the first test 
 
 - Existing `MCPToolManager` caches read results by tool name and params only, without caller context. Thus cached `get_case` and `check_budget` responses could be reused across different callers who supply the same case ID during the short TTL. Fixing this safely requires a manager-level context-aware cache key or bypass; that file is outside this task's authorized edit scope. The controller should address this before exposing case reads to untrusted callers.
 - The API serialization test in the existing suite was skipped because optional API dependencies are not installed in this worktree's virtual environment.
+
+## Review fixes (follow-up commit)
+
+The three Important findings were reproduced before changes:
+
+1. `.venv\Scripts\python.exe -m unittest tests.test_reimbursement_tools -v` exited 1 (12 tests, 7 failures). The cache tests showed the same params returning a cached result to another user or conversation. `MCPToolManager._cache_key()` used only tool name and params, before handler authorization.
+2. The same RED run showed a rejected claim left the engineering budget at 2200.0 instead of restoring 3000.0. The old rejection path changed only case state with `save_case()`.
+3. The same RED run showed NaN/infinity accepted by validation or submission, including a NaN budget after direct repository submission.
+
+Fixes:
+
+- `mcp/tool_manager.py` now incorporates trusted `user_id` and `conv_id` in cache keys whenever context is supplied; calls without context retain the previous key behavior. Manager-level tests cover a cache hit for the same identity, misses for another user and conversation, and a hit with absent context. `get_case` and `check_budget` tests also verify denied cross-identity calls after a cache entry exists.
+- `core/reimbursement_repository.py` records the exact reserved amount per case and exposes `reject_claim()`, which releases it and changes state under the same lock, once. `review_claim` routes rejection through this method. The regression test submits, rejects, confirms duplicate rejection fails without a second refund, revalidates, and resubmits with a new key; final budget is 2200.0.
+- Tool validation rejects nonfinite individual amounts and overflowed totals. Repository submission independently rejects nonfinite or nonpositive required budget and nonfinite available budget before any mutation. Tests cover NaN, positive/negative infinity, a finite unchanged budget, and the repository invariant.
+
+GREEN evidence: `.venv\Scripts\python.exe -m unittest tests.test_reimbursement_tools tests.test_agent_tools tests.test_reimbursement_models_repository -v` exited 0: 30 tests run, 1 skipped (`API dependencies not installed`). `git diff --check` exited 0. The focused test command ran elevated because the initial sandboxed asyncio unittest had hung earlier in this task. No dependencies were installed.
+
+Self-review: cache-key changes affect only calls with context; a rejected reservation cannot be released twice because the method requires `SUBMITTED` plus `budget_reserved`, and records the original amount rather than recomputing it from editable claim data. Submission amount is checked before budget mutation. The cache-leak concern in the original report is resolved by this follow-up. The optional API serialization test remains skipped in this environment.

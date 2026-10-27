@@ -1,6 +1,7 @@
 """Async, process-local persistence for reimbursement harness cases."""
 
 import asyncio
+import math
 from copy import deepcopy
 from typing import Any, Callable
 from uuid import uuid4
@@ -29,6 +30,7 @@ class InMemoryReimbursementRepository:
         self._cases: dict[str, ReimbursementCase] = {}
         self._active_cases: dict[tuple[str, str], str] = {}
         self._idempotency_results: dict[str, dict[str, Any]] = {}
+        self._reserved_amounts: dict[str, float] = {}
         self._lock = asyncio.Lock()
 
     async def get_or_create_active_case(
@@ -117,9 +119,14 @@ class InMemoryReimbursementRepository:
                 raise ValueError("报销单校验未通过")
             amount = float(validation["required_budget"])
             available = float(self._budgets.get(case.department, 0.0))
+            if not math.isfinite(amount) or amount <= 0:
+                raise ValueError("报销金额必须是有限正数")
+            if not math.isfinite(available):
+                raise ValueError("部门预算数据无效")
             if available < amount:
                 raise ValueError("部门预算不足")
             self._budgets[case.department] = available - amount
+            self._reserved_amounts[case.case_id] = amount
             case.claim_no = f"CLM-{uuid4().hex[:12].upper()}"
             case.budget_reserved = True
             case.validation = deepcopy(validation)
@@ -130,3 +137,16 @@ class InMemoryReimbursementRepository:
                       "budget_reserved": True}
             self._idempotency_results[key] = deepcopy(result)
             return deepcopy(result)
+
+    async def reject_claim(self, case_id: str) -> ReimbursementCase:
+        """Release a submitted claim's exact reservation once under the repository lock."""
+        async with self._lock:
+            case = self._cases.get(case_id)
+            if case is None or case.state != ClaimState.SUBMITTED or not case.budget_reserved:
+                raise ValueError("报销单尚未提交或预算已经释放")
+            amount = self._reserved_amounts.pop(case_id)
+            self._budgets[case.department] += amount
+            case.budget_reserved = False
+            case.state = ClaimState.REWORK_REQUIRED
+            case.version += 1
+            return deepcopy(case)

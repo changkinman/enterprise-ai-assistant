@@ -1,6 +1,7 @@
 """Deterministic, process-local reimbursement tools for the billing Agent."""
 
 from dataclasses import asdict
+import math
 from typing import Any
 
 from core.reimbursement_models import ClaimState, ReimbursementCase
@@ -21,7 +22,8 @@ def _validate(case: ReimbursementCase) -> dict[str, Any]:
     total = 0.0
     for item in case.expenses:
         amount = item.get("amount")
-        if not isinstance(amount, (int, float)) or isinstance(amount, bool) or amount <= 0:
+        if (not isinstance(amount, (int, float)) or isinstance(amount, bool)
+                or not math.isfinite(amount) or amount <= 0):
             issues.append({"code": "invalid_amount", "message": "费用金额必须大于零"})
             continue
         total += float(amount)
@@ -29,6 +31,9 @@ def _validate(case: ReimbursementCase) -> dict[str, Any]:
             issues.append({"code": "hotel_over_limit", "message": f"酒店费用超过{city}标准{limit}元"})
     if not case.expenses:
         issues.append({"code": "missing_expenses", "message": "缺少费用明细"})
+    if not math.isfinite(total):
+        issues.append({"code": "invalid_amount", "message": "费用总额必须是有限正数"})
+        total = 0.0
     total = round(total, 2)
     return {"valid": not issues, "issues": issues,
             "total_amount": total, "required_budget": total}
@@ -118,8 +123,7 @@ def build_tools(repository: InMemoryReimbursementRepository) -> list[Tool]:
             case.validation["review_approved"] = True
             await repository.save_case(case)
         else:
-            case.state = ClaimState.REWORK_REQUIRED
-            await repository.save_case(case)
+            case = await repository.reject_claim(case.case_id)
         return {"case_id": case.case_id, "approved": params["approved"], "state": case.state.value}
 
     async def simulate_payment(params, context):
