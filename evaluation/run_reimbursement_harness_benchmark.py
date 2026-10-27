@@ -56,7 +56,7 @@ class ReimbursementHarnessBenchmark:
         traces = []
         step_traces: list[list[Any]] = []
         case = None
-        for step in fixture["steps"]:
+        for step_index, step in enumerate(fixture["steps"], start=1):
             if "review" in step:
                 if case is None:
                     raise AssertionError("review requires a submitted case")
@@ -69,6 +69,10 @@ class ReimbursementHarnessBenchmark:
             if disabled:
                 manager.unregister(disabled)
             try:
+                # Each fixture step is a new logical user operation. Retrying a
+                # step would retain this identifier; a later supplement must not
+                # replay the earlier create/validate writes.
+                request.request_id = f"{fixture['id']}:{step_index}"
                 request.message = step.get(
                     "message",
                     "确认提交这笔报销" if step.get("explicit_confirmation") is True else "离线报销测试",
