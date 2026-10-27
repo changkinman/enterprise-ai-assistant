@@ -166,6 +166,17 @@ class InMemoryReimbursementRepository:
             self._write_results[key] = deepcopy(result)
             return deepcopy(result)
 
+    async def get_write_result(self, case_id: str, action: str,
+                               idempotency_key: str, payload: Any) -> dict[str, Any] | None:
+        """Return a completed write only when the retry payload matches exactly."""
+        async with self._lock:
+            key = (case_id, action, idempotency_key)
+            if key not in self._write_results:
+                return None
+            if self._write_payloads[key] != payload:
+                raise ValueError("幂等键已用于不同的请求")
+            return deepcopy(self._write_results[key])
+
     async def review_claim(self, case_id: str, approved: bool, idempotency_key: str) -> dict[str, Any]:
         """Approve or reject using the current stored state under one lock."""
         def mutate(case):

@@ -71,7 +71,8 @@ class ReimbursementCaseHarness:
         if name in {"create_draft", "add_expense_items", "validate_claim", "submit_claim",
                     "review_claim", "simulate_payment"}:
             arguments = {"case_id": case.case_id,
-                         "idempotency_key": f"{case.case_id}:{name}:{case.version}", **arguments}
+                         "idempotency_key": f"{case.case_id}:{context.get('request_id', uuid4().hex)}:{name}",
+                         **arguments}
         try:
             result = await self.tool_manager.call(name, arguments, context,
                                                   caller_agent="billing", use_cache=False)
@@ -155,7 +156,8 @@ class ReimbursementCaseHarness:
                                                                 "state": case.state.value})
             return HarnessResult("当前报销状态不允许这项操作，请查询案件状态。", case, traces, False)
 
-        context = {"user_id": req.user_id, "conv_id": req.conv_id, "agent_type": "billing"}
+        context = {"user_id": req.user_id, "conv_id": req.conv_id, "agent_type": "billing",
+                   "request_id": req.request_id}
         if action == ReimbursementAction.GET_STATUS:
             case, ok, data = await self._call(case, "get_case", {"case_id": case.case_id}, context, traces)
             if not ok:
@@ -191,9 +193,8 @@ class ReimbursementCaseHarness:
                 case = await self._event(case, "state_rejection", {"reason": "confirmation_not_explicit"})
                 return HarnessResult("请明确回复“确认提交这笔报销”后再提交。", case, traces, True)
             else:
-                key = f"{case.case_id}:submit:{case.version}"
                 case, ok, data = await self._call(case, "submit_claim",
-                                                  {"case_id": case.case_id, "idempotency_key": key},
+                                                  {"case_id": case.case_id},
                                                   {**context, "confirmed": True}, traces)
                 if not ok:
                     return await self._failed(case, traces, start_state)
@@ -304,15 +305,21 @@ class ReimbursementCaseHarness:
         }
 
     async def review_claim(self, case_id: str, reviewer_id: str, approved: bool,
-                           comment: str = "") -> dict[str, Any]:
+                           comment: str = "", request_id: str | None = None) -> dict[str, Any]:
         async with self._lock_for(case_id):
-            return await self._review_locked(case_id, reviewer_id, approved, comment)
+            return await self._review_locked(case_id, reviewer_id, approved, comment, request_id)
 
     async def _review_locked(self, case_id: str, reviewer_id: str, approved: bool,
-                             comment: str) -> dict[str, Any]:
+                             comment: str, request_id: str | None) -> dict[str, Any]:
         case = await self.repository.get_case(case_id)
         if case is None:
             raise ValueError("报销单不存在")
+        logical_id = request_id or uuid4().hex
+        write_key = f"{case_id}:{logical_id}:review_claim"
+        replay = await self.repository.get_write_result(case_id, "review_claim", write_key,
+                                                        {"approved": approved})
+        if replay is not None:
+            return replay
         if case.state != ClaimState.SUBMITTED:
             self._stats["state_rejections"] += 1
             await self._event(case, "state_rejection", {"action": "review_claim",
@@ -321,7 +328,8 @@ class ReimbursementCaseHarness:
         traces: list[HarnessToolTrace] = []
         case, ok, data = await self._call(case, "review_claim",
                                           {"case_id": case_id, "approved": approved},
-                                          {"user_id": reviewer_id, "conv_id": case.conv_id}, traces)
+                                          {"user_id": reviewer_id, "conv_id": case.conv_id,
+                                           "request_id": logical_id}, traces)
         if not ok:
             await self._event(case, "tool_failure", {"tool": "review_claim", "error": traces[-1].error})
             self._stats["tool_failure_recoveries"] += 1
@@ -330,14 +338,21 @@ class ReimbursementCaseHarness:
             await self._event(case, "review_comment", {"comment": comment})
         return data
 
-    async def simulate_payment(self, case_id: str, finance_user_id: str) -> dict[str, Any]:
+    async def simulate_payment(self, case_id: str, finance_user_id: str,
+                               request_id: str | None = None) -> dict[str, Any]:
         async with self._lock_for(case_id):
-            return await self._payment_locked(case_id, finance_user_id)
+            return await self._payment_locked(case_id, finance_user_id, request_id)
 
-    async def _payment_locked(self, case_id: str, finance_user_id: str) -> dict[str, Any]:
+    async def _payment_locked(self, case_id: str, finance_user_id: str,
+                              request_id: str | None) -> dict[str, Any]:
         case = await self.repository.get_case(case_id)
         if case is None:
             raise ValueError("报销单不存在")
+        logical_id = request_id or uuid4().hex
+        write_key = f"{case_id}:{logical_id}:simulate_payment"
+        replay = await self.repository.get_write_result(case_id, "simulate_payment", write_key, None)
+        if replay is not None:
+            return replay
         if case.state != ClaimState.SUBMITTED or not case.validation.get("review_approved"):
             self._stats["state_rejections"] += 1
             await self._event(case, "state_rejection", {"action": "simulate_payment",
@@ -345,7 +360,8 @@ class ReimbursementCaseHarness:
             raise ValueError("报销单尚未审核通过")
         traces: list[HarnessToolTrace] = []
         case, ok, data = await self._call(case, "simulate_payment", {"case_id": case_id},
-                                          {"user_id": finance_user_id, "conv_id": case.conv_id}, traces)
+                                          {"user_id": finance_user_id, "conv_id": case.conv_id,
+                                           "request_id": logical_id}, traces)
         if not ok:
             await self._event(case, "tool_failure", {"tool": "simulate_payment", "error": traces[-1].error})
             self._stats["tool_failure_recoveries"] += 1

@@ -2,6 +2,7 @@ import asyncio
 import sys
 import unittest
 from types import SimpleNamespace
+from uuid import uuid4
 
 sys.modules.setdefault("anthropic", SimpleNamespace(AsyncAnthropic=lambda **_: None))
 
@@ -25,7 +26,7 @@ class DecisionProvider:
 
 
 def request(message="报销"):
-    return SimpleNamespace(message=message, user_id="emp-001", conv_id="conv-1", request_id="req-1")
+    return SimpleNamespace(message=message, user_id="emp-001", conv_id="conv-1", request_id=uuid4().hex)
 
 
 class HarnessTests(unittest.IsolatedAsyncioTestCase):
@@ -195,6 +196,18 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
         paid = await self.harness.simulate_payment(submitted.case.case_id, "finance-001")
         self.assertEqual(paid["state"], "paid")
         self.assertEqual((await self.harness.get_case_view(submitted.case.case_id))["state"], "paid")
+
+    async def test_review_retry_replays_same_request_after_state_and_events_change(self):
+        submitted = await self.submitted()
+        case_id = submitted.case.case_id
+        first = await self.harness.review_claim(case_id, "manager-001", False,
+                                                request_id="review-request-1")
+        event_count = len((await self.repo.get_case(case_id)).events)
+        replay = await self.harness.review_claim(case_id, "manager-001", False,
+                                                 request_id="review-request-1")
+        self.assertEqual(replay, first)
+        self.assertEqual(len((await self.repo.get_case(case_id)).events), event_count)
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 3000)
 
     async def test_governed_review_denial_keeps_submitted_state(self):
         submitted = await self.submitted()
