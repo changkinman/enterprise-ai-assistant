@@ -63,13 +63,19 @@ class InMemoryReimbursementRepository:
     async def save_case(self, case: ReimbursementCase) -> ReimbursementCase:
         async with self._lock:
             stored = self._cases.get(case.case_id)
+            saved = deepcopy(case)
             if stored is None:
-                saved = deepcopy(case)
+                # A caller-created case starts at its supplied pre-save version.
+                saved.version = case.version + 1
             else:
-                saved = deepcopy(case)
-                saved.version = stored.version + (saved != stored)
+                saved.version = stored.version
+                changed = saved != stored
+                saved.version = stored.version + int(changed)
             self._cases[case.case_id] = saved
-            self._active_cases[(saved.user_id, saved.conv_id)] = saved.case_id
+            active_key = (saved.user_id, saved.conv_id)
+            active_id = self._active_cases.get(active_key)
+            if active_id is None or active_id == saved.case_id:
+                self._active_cases[active_key] = saved.case_id
             return deepcopy(saved)
 
     async def remaining_budget(self, department: str) -> float:

@@ -1,6 +1,6 @@
 import unittest
 
-from core.reimbursement_models import ClaimState
+from core.reimbursement_models import ClaimState, ExecutionEvent, ReimbursementCase
 from core.reimbursement_repository import InMemoryReimbursementRepository
 
 
@@ -27,6 +27,37 @@ class ReimbursementRepositoryTests(unittest.IsolatedAsyncioTestCase):
         await repo.save_case(case)
         replacement = await repo.get_or_create_active_case("emp-001", "conv-1")
         self.assertNotEqual(replacement.case_id, case.case_id)
+
+    async def test_saving_unknown_changed_case_increments_its_version(self):
+        repo = InMemoryReimbursementRepository()
+        case = ReimbursementCase(
+            case_id="RMB-unknown",
+            user_id="emp-001",
+            conv_id="conv-unknown",
+            state=ClaimState.DRAFT_CREATED,
+        )
+        saved = await repo.save_case(case)
+        self.assertEqual(saved.version, case.version + 1)
+
+    async def test_saving_old_closed_case_keeps_newer_active_case_indexed(self):
+        repo = InMemoryReimbursementRepository()
+        old_case = await repo.get_or_create_active_case("emp-001", "conv-1")
+        old_case.state = ClaimState.CLOSED
+        await repo.save_case(old_case)
+
+        replacement = await repo.get_or_create_active_case("emp-001", "conv-1")
+        old_case.events.append(
+            # A later save to the old terminal record must not steal active ownership.
+            ExecutionEvent(
+                at=old_case.created_at,
+                version=old_case.version,
+                event_type="audit_note",
+                detail={},
+            )
+        )
+        await repo.save_case(old_case)
+        active = await repo.get_or_create_active_case("emp-001", "conv-1")
+        self.assertEqual(active.case_id, replacement.case_id)
 
     async def test_save_increments_version_once_and_reads_are_defensive(self):
         repo = InMemoryReimbursementRepository()
