@@ -49,6 +49,7 @@ _memory       = None
 _tool_manager = None
 _monitor      = None
 _evaluator    = None
+_reimbursement_harness = None
 
 
 def _anthropic_cfg() -> Dict[str, Any]:
@@ -67,7 +68,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _reimbursement_harness
 
     print(BANNER, flush=True)
 
@@ -142,12 +143,13 @@ async def lifespan(app: FastAPI):
     ))
 
     from core.reimbursement_repository import InMemoryReimbursementRepository
+    from core.reimbursement_harness import ReimbursementCaseHarness
 
     reimbursement_repository = InMemoryReimbursementRepository()
-    app.state.reimbursement_repository = reimbursement_repository
     agent_tool_names = discover_agent_tools(
         _tool_manager, dependencies={"reimbursement_repository": reimbursement_repository}
     )
+    _reimbursement_harness = ReimbursementCaseHarness(reimbursement_repository, _tool_manager)
     logger.info(f"Agent 工具已加载: {agent_tool_names}")
 
     # Agent 编排器在工具注册完成后创建，确保所有 Agent 取得完整工具目录。
@@ -156,6 +158,7 @@ async def lifespan(app: FastAPI):
         base_url=cfg.get("base_url"),
         model=cfg["model"],
         tool_manager=_tool_manager,
+        reimbursement_harness=_reimbursement_harness,
         max_tool_rounds=int(os.getenv("MAX_TOOL_ROUNDS", "5")),
     )
     # 性能监控（可选启动 Prometheus）
@@ -232,7 +235,57 @@ class ChatResponse(BaseModel):
     execution_mode: str = "single"
 
 
+class ReviewInput(BaseModel):
+    reviewer_id: str
+    approved: bool
+    comment: str = ""
+
+
+class PaymentInput(BaseModel):
+    finance_user_id: str
+
+
 # ── 路由 ──────────────────────────────────────────────────────────────────────
+@app.get("/reimbursements/{case_id}")
+async def get_reimbursement_case(case_id: str):
+    if _reimbursement_harness is None:
+        raise HTTPException(503, "服务未就绪")
+    view = await _reimbursement_harness.get_case_view(case_id)
+    if view is None:
+        raise HTTPException(404, "报销单不存在")
+    return view
+
+
+@app.post("/reimbursements/{case_id}/review")
+async def review_reimbursement_claim(case_id: str, body: ReviewInput):
+    if _reimbursement_harness is None:
+        raise HTTPException(503, "服务未就绪")
+    if body.reviewer_id != "manager-001":
+        raise HTTPException(403, "仅经理可审核报销单")
+    if await _reimbursement_harness.get_case_view(case_id) is None:
+        raise HTTPException(404, "报销单不存在")
+    try:
+        return await _reimbursement_harness.review_claim(
+            case_id, body.reviewer_id, body.approved, body.comment
+        )
+    except ValueError as exc:
+        raise HTTPException(404 if "不存在" in str(exc) else 409, str(exc)) from exc
+
+
+@app.post("/reimbursements/{case_id}/payment")
+async def pay_reimbursement_claim(case_id: str, body: PaymentInput):
+    if _reimbursement_harness is None:
+        raise HTTPException(503, "服务未就绪")
+    if body.finance_user_id != "finance-001":
+        raise HTTPException(403, "仅财务人员可支付报销单")
+    if await _reimbursement_harness.get_case_view(case_id) is None:
+        raise HTTPException(404, "报销单不存在")
+    try:
+        return await _reimbursement_harness.simulate_payment(case_id, body.finance_user_id)
+    except ValueError as exc:
+        raise HTTPException(404 if "不存在" in str(exc) else 409, str(exc)) from exc
+
+
 @app.get("/health")
 async def health():
     if _orchestrator is None:
