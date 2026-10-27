@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional
 from anthropic import AsyncAnthropic
 
 from core.intent_recognizer import FunnelDecisionKind, IntentCategory, IntentRecognizer, UrgencyLevel
+from core.reimbursement_harness import ReimbursementCaseHarness
+from core.reimbursement_models import ReimbursementAction, ReimbursementCase, ReimbursementDecision
 from core.task_planner import BusinessDomain, ExecutionMode, PlannedTask, TaskPlan, TaskPlanner
 from mcp.tool_manager import MCPToolManager
 
@@ -339,9 +341,59 @@ class TechnicalAgent(BaseAgent):
 class BillingAgent(BaseAgent):
     agent_type    = AgentType.BILLING
     system_prompt = (
-        "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
-        "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
+        "你是企业员工差旅报销助手。你的职责是从员工消息中提取报销事实，"
+        "并建议下一步动作；实际状态变更和工具调用由报销流程执行。"
+        "在收到报销流程的结果前，不得声称草稿已创建、报销单已提交或款项已支付。"
     )
+
+    async def decide_reimbursement(
+        self, req: Request, case: ReimbursementCase
+    ) -> ReimbursementDecision:
+        """Make a structured proposal only; the Harness owns every tool call."""
+        fallback = ReimbursementDecision({}, ReimbursementAction.COLLECT_FACTS,
+                                         False, req.message)
+        case_context = {
+            "state": case.state.value,
+            "facts": case.facts,
+            "expenses": case.expenses,
+        }
+        system = (
+            self.system_prompt
+            + "只返回一个 JSON 对象，字段必须是 facts、action、explicit_confirmation。"
+              "facts 只能包含 trip_city、trip_date、project_code、expenses；"
+              "expenses 必须是由 type 和 amount 组成的对象数组。"
+              "action 只能是 collect_facts、validate、confirm_submit、get_status。"
+              "只有员工在本轮明确要求提交这笔报销时，explicit_confirmation 才能为 true；"
+              "其他情况必须为 false。不要返回 Markdown 或额外说明。"
+        )
+        messages = [{
+            "role": "user",
+            "content": (
+                f"当前报销单：{json.dumps(case_context, ensure_ascii=False, default=str)}\n"
+                f"背景信息：{req.context}\n员工消息：{req.message}"
+            ),
+        }]
+        response = await self._client.messages.create(
+            model=self._model, max_tokens=1024, system=system, messages=messages,
+        )
+        text = self._text_from_blocks(self._serialize_content(response.content))
+        try:
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("facts"), dict):
+                return fallback
+            if not isinstance(parsed.get("explicit_confirmation"), bool):
+                return fallback
+            action = ReimbursementAction(parsed.get("action"))
+            raw_facts = parsed["facts"]
+            if "expenses" in raw_facts and not isinstance(raw_facts["expenses"], list):
+                return fallback
+            facts = {key: raw_facts[key] for key in
+                     ("trip_city", "trip_date", "project_code", "expenses")
+                     if key in raw_facts}
+            return ReimbursementDecision(facts, action,
+                                         parsed["explicit_confirmation"], req.message)
+        except (ValueError, TypeError):
+            return fallback
 
 
 # ── 编排器 ────────────────────────────────────────────────────────────────────
@@ -373,6 +425,7 @@ class AgentOrchestrator:
         tool_manager: Optional[MCPToolManager] = None,
         max_tool_rounds: int = 5,
         client: Optional[Any] = None,
+        reimbursement_harness: Optional[ReimbursementCaseHarness] = None,
     ):
         if client is None:
             kwargs: Dict[str, Any] = {"api_key": api_key}
@@ -382,6 +435,7 @@ class AgentOrchestrator:
 
         self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
         self._task_planner = TaskPlanner(api_key=api_key, base_url=base_url, model=model)
+        self._reimbursement_harness = reimbursement_harness
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
@@ -631,14 +685,37 @@ class AgentOrchestrator:
                 success=False,
             )
 
-        response = await agent.handle(req)
+        harness = getattr(self, "_reimbursement_harness", None)
+        if agent_type == AgentType.BILLING and harness is not None and agent.agent_type == AgentType.BILLING:
+            t0 = time.monotonic()
+            agent.stats.total += 1
+            try:
+                result = await harness.handle(req, agent)
+                ms = (time.monotonic() - t0) * 1000
+                if result.success:
+                    agent.stats.success += 1
+                response = AgentResponse(
+                    AgentType.BILLING, result.content, result.success, latency_ms=ms,
+                    tool_calls=[ToolCallTrace(**vars(trace)) for trace in result.tool_calls],
+                )
+            except Exception as ex:
+                ms = (time.monotonic() - t0) * 1000
+                logger.error("billing 报销流程失败: %s", ex)
+                response = AgentResponse(AgentType.BILLING,
+                                         "抱歉，处理您的报销请求时出现问题，请稍后重试。",
+                                         False, latency_ms=ms)
+            agent.stats.total_ms += ms
+        else:
+            response = await agent.handle(req)
 
         # 专属 Agent 失败时降级到 GeneralAgent
         if not response.success and agent_type != AgentType.GENERAL:
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
             if fallback:
-                response = await fallback.handle(req)
+                fallback_response = await fallback.handle(req)
+                fallback_response.tool_calls = response.tool_calls + fallback_response.tool_calls
+                response = fallback_response
 
         return response
 
