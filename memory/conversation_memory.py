@@ -231,6 +231,34 @@ class MemoryManager:
             summary=summary,
         )
 
+    async def save_pending_clarification(
+        self,
+        user_id: str,
+        conv_id: str,
+        state: Dict[str, Any],
+        ttl_s: int = 600,
+    ) -> None:
+        """保存一次待澄清的任务计划，避免下一轮补充被当作孤立消息。"""
+        key = self._pending_clarification_key(self._safe_text(user_id), self._safe_text(conv_id))
+        self._redis.setex(key, ttl_s, json.dumps(state, ensure_ascii=False, default=str))
+
+    async def get_pending_clarification(self, user_id: str, conv_id: str) -> Optional[Dict[str, Any]]:
+        """读取有效的待澄清状态；损坏数据不会进入后续规划。"""
+        key = self._pending_clarification_key(self._safe_text(user_id), self._safe_text(conv_id))
+        raw = self._redis.get(key)
+        if not raw:
+            return None
+        try:
+            state = json.loads(raw)
+            return state if isinstance(state, dict) else None
+        except (TypeError, json.JSONDecodeError):
+            self._redis.delete(key)
+            return None
+
+    async def clear_pending_clarification(self, user_id: str, conv_id: str) -> None:
+        key = self._pending_clarification_key(self._safe_text(user_id), self._safe_text(conv_id))
+        self._redis.delete(key)
+
     # ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
 
     async def _compress(self, user_id: str, conv_id: str) -> None:
@@ -353,6 +381,10 @@ class MemoryManager:
     @staticmethod
     def _summary_key(user_id: str, conv_id: str) -> str:
         return f"summary:{user_id}:{conv_id}"
+
+    @staticmethod
+    def _pending_clarification_key(user_id: str, conv_id: str) -> str:
+        return f"pending_clarification:{user_id}:{conv_id}"
 
     @staticmethod
     def _safe_text(value: Any) -> str:

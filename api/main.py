@@ -223,6 +223,7 @@ class ChatResponse(BaseModel):
     latency_ms:  float
     knowledge_used: bool = False
     tool_calls: List[ToolCallResponse] = Field(default_factory=list)
+    execution_mode: str = "single"
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
@@ -270,8 +271,17 @@ async def chat(req: ChatRequest):
         history=history,
     )
 
-    # 3. 执行
-    result = await _orchestrator.run(orch_req)
+    # 3. 规划并执行。澄清回复会和原始问题一起进入下一轮规划。
+    pending_clarification = await _memory.get_pending_clarification(req.user_id, conv_id)
+    plan = await _orchestrator.plan_request(orch_req, pending_clarification=pending_clarification)
+    result = await _orchestrator.run_plan(orch_req, plan)
+    if result.execution_mode == "clarify" and result.clarification_state:
+        clarification_state = dict(result.clarification_state)
+        if pending_clarification and pending_clarification.get("original_message"):
+            clarification_state["original_message"] = pending_clarification["original_message"]
+        await _memory.save_pending_clarification(req.user_id, conv_id, clarification_state)
+    elif pending_clarification:
+        await _memory.clear_pending_clarification(req.user_id, conv_id)
 
     # 4. 写入记忆
     await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
@@ -288,6 +298,7 @@ async def chat(req: ChatRequest):
         escalated=result.escalated,
         latency_ms=round(result.latency_ms, 1),
         knowledge_used=knowledge_used,
+        execution_mode=result.execution_mode,
         tool_calls=[
             ToolCallResponse(**{
                 "round": trace.round,

@@ -20,13 +20,14 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
-from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
+from core.intent_recognizer import FunnelDecisionKind, IntentCategory, IntentRecognizer, UrgencyLevel
+from core.task_planner import BusinessDomain, ExecutionMode, PlannedTask, TaskPlan, TaskPlanner
 from mcp.tool_manager import MCPToolManager
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,8 @@ class OrchestratorResult:
     escalated:   bool  = False
     latency_ms:  float = 0.0
     tool_calls:  List[ToolCallTrace] = field(default_factory=list)
+    execution_mode: str = ExecutionMode.SINGLE.value
+    clarification_state: Optional[Dict[str, Any]] = None
 
 
 # ── 基础 Agent ────────────────────────────────────────────────────────────────
@@ -378,6 +381,7 @@ class AgentOrchestrator:
             client = AsyncAnthropic(**kwargs)
 
         self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
+        self._task_planner = TaskPlanner(api_key=api_key, base_url=base_url, model=model)
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
@@ -391,43 +395,146 @@ class AgentOrchestrator:
     async def run(self, req: Request) -> OrchestratorResult:
         """
         处理一次请求的完整流程：
-          意图识别 → 路由选 Agent → 执行 → 检查升级 → 返回结果
+          多领域候选 → 任务计划 → 执行模式决策 → Agent 执行
         """
+        plan = await self.plan_request(req)
+        return await self.run_plan(req, plan)
+
+    async def plan_request(
+        self,
+        req: Request,
+        pending_clarification: Optional[Dict[str, Any]] = None,
+    ) -> TaskPlan:
+        """生成请求计划；澄清回复会与原始问题合并后重新规划。"""
+        message = req.message
+        if pending_clarification:
+            original = str(pending_clarification.get("original_message", "")).strip()
+            if original:
+                message = f"{original}\n用户补充：{req.message}"
+            # 用户正在补充先前的歧义问题时，必须重新做完整语义分析，不能被短文本规则截获。
+            analysis = await self._intent_recognizer.analyze_domains(message, history=req.history)
+            return await self._task_planner.plan(message, analysis, history=req.history)
+
+        decision = self._intent_recognizer.funnel_decision(message)
+        if decision.kind == FunnelDecisionKind.DIRECT_REPLY:
+            return TaskPlan(
+                ExecutionMode.DIRECT,
+                direct_response=decision.reply,
+                reason=decision.reason,
+            )
+        if decision.kind == FunnelDecisionKind.LIGHTWEIGHT and decision.analysis is not None:
+            return self._task_planner.decide(message, decision.analysis.candidates, ())
+
+        # 只有不确定、长文本或复合请求会进入 LLM 候选分析与任务拆分。
+        analysis = await self._intent_recognizer.analyze_domains(message, history=req.history)
+        return await self._task_planner.plan(message, analysis, history=req.history)
+
+    async def run_plan(self, req: Request, plan: TaskPlan) -> OrchestratorResult:
+        """按任务计划执行单路、并行、串行或澄清分支。"""
         t0 = time.monotonic()
+        if plan.mode == ExecutionMode.DIRECT:
+            return OrchestratorResult(
+                request_id=req.request_id,
+                response=plan.direct_response,
+                agent_type=AgentType.GENERAL,
+                intent=IntentCategory.GREETING,
+                latency_ms=(time.monotonic() - t0) * 1000,
+                execution_mode=plan.mode.value,
+            )
+        if plan.mode == ExecutionMode.CLARIFY:
+            return OrchestratorResult(
+                request_id=req.request_id,
+                response=plan.clarification_question,
+                agent_type=AgentType.GENERAL,
+                intent=None,
+                latency_ms=(time.monotonic() - t0) * 1000,
+                execution_mode=plan.mode.value,
+                clarification_state=plan.to_pending_state(req.message),
+            )
 
-        # 1. 意图识别（如果调用方已识别则跳过）
-        if req.intent is None:
-            intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
-            req.intent  = intent_result.intent
-            req.urgency = intent_result.urgency
+        if plan.mode == ExecutionMode.PARALLEL:
+            responses = await asyncio.gather(*(self._execute_task(req, task) for task in plan.tasks))
+        elif plan.mode == ExecutionMode.SEQUENTIAL:
+            responses = await self._execute_sequential(req, plan.tasks)
+        else:
+            responses = [await self._execute_task(req, plan.tasks[0])]
 
-        # 复杂问题自动并行协作，例如同一句同时涉及登录故障和扣款/退款。
-        collaboration = self._collaboration_targets(req)
-        if len(collaboration) > 1:
-            return await self.run_parallel(req, collaboration)
-
-        # 2. 路由：选择 Agent 类型
-        agent_type = self._route(req.intent, req.urgency)
-
-        # 3. 执行（含降级）
-        response = await self._execute(req, agent_type)
-
-        # 4. 升级检查
-        escalated = False
-        if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent == IntentCategory.ESCALATION:
-            escalated = True
-            logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
-            # 生产环境：此处创建工单、通知人工客服
-
+        tool_calls = [trace for response in responses for trace in response.tool_calls]
+        first = responses[0]
+        escalated = any(
+            response.escalate or bool(task.modifiers.get("escalation_requested"))
+            for response, task in zip(responses, plan.tasks)
+        )
         return OrchestratorResult(
             request_id=req.request_id,
-            response=response.content,
-            agent_type=response.agent_type,
-            intent=req.intent,
+            response=self._format_task_responses(responses),
+            agent_type=first.agent_type,
+            intent=self._intent_for_domain(plan.tasks[0].domain),
             escalated=escalated,
             latency_ms=(time.monotonic() - t0) * 1000,
-            tool_calls=response.tool_calls,
+            tool_calls=tool_calls,
+            execution_mode=plan.mode.value,
         )
+
+    async def _execute_task(self, req: Request, task: PlannedTask) -> AgentResponse:
+        """仅向领域 Agent 传递当前子任务，避免其他任务污染上下文。"""
+        task_context = (
+            f"[当前任务]\n领域: {task.domain.value}\n主体: {task.entity}\n"
+            f"动作: {task.action}\n证据: {task.evidence}"
+        )
+        context = f"{req.context}\n\n{task_context}" if req.context else task_context
+        task_req = replace(
+            req,
+            message=task.evidence,
+            context=context,
+            intent=self._intent_for_domain(task.domain),
+        )
+        return await self._execute(task_req, self._agent_for_domain(task.domain))
+
+    async def _execute_sequential(self, req: Request, tasks: tuple[PlannedTask, ...]) -> List[AgentResponse]:
+        """按依赖图拓扑顺序执行；前置结果只传递给其后续任务。"""
+        pending = {task.task_id: task for task in tasks}
+        completed: Dict[str, AgentResponse] = {}
+        results: List[AgentResponse] = []
+        while pending:
+            ready = [task for task in pending.values() if all(dep in completed for dep in task.depends_on)]
+            if not ready:
+                return [AgentResponse(AgentType.GENERAL, "任务依赖关系无法执行，请补充问题。", False)]
+            for task in ready:
+                dependency_context = "\n".join(
+                    f"[前置任务 {dep} 的结果]\n{completed[dep].content}"
+                    for dep in task.depends_on
+                )
+                scoped_req = replace(req, context=f"{req.context}\n{dependency_context}".strip())
+                response = await self._execute_task(scoped_req, task)
+                completed[task.task_id] = response
+                results.append(response)
+                del pending[task.task_id]
+        return results
+
+    @staticmethod
+    def _format_task_responses(responses: List[AgentResponse]) -> str:
+        if len(responses) == 1:
+            return responses[0].content
+        return "\n\n".join(f"{index}. {response.content}" for index, response in enumerate(responses, start=1))
+
+    @staticmethod
+    def _agent_for_domain(domain: BusinessDomain) -> AgentType:
+        return {
+            BusinessDomain.GENERAL: AgentType.GENERAL,
+            BusinessDomain.TECHNICAL: AgentType.TECHNICAL,
+            BusinessDomain.BILLING: AgentType.BILLING,
+            BusinessDomain.ACCOUNT: AgentType.GENERAL,
+        }[domain]
+
+    @staticmethod
+    def _intent_for_domain(domain: BusinessDomain) -> IntentCategory:
+        return {
+            BusinessDomain.GENERAL: IntentCategory.QUERY,
+            BusinessDomain.TECHNICAL: IntentCategory.TECHNICAL,
+            BusinessDomain.BILLING: IntentCategory.BILLING,
+            BusinessDomain.ACCOUNT: IntentCategory.ACCOUNT,
+        }[domain]
 
     async def run_parallel(self, req: Request, agent_types: List[AgentType]) -> OrchestratorResult:
         """

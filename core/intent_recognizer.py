@@ -19,6 +19,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
+from core.task_planner import BusinessDomain, DomainAnalysis, DomainCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,24 @@ def _cosine(a: List[float], b: List[float]) -> float:
     return dot / (na * nb) if na and nb else 0.0
 
 
+class FunnelDecisionKind(str, Enum):
+    """意图漏斗前两层的处理结果。"""
+
+    DIRECT_REPLY = "direct_reply"
+    LIGHTWEIGHT = "lightweight"
+    ESCALATE = "escalate"
+
+
+@dataclass(frozen=True)
+class FunnelDecision:
+    """无需模型调用的预路由决定。"""
+
+    kind: FunnelDecisionKind
+    analysis: Optional[DomainAnalysis] = None
+    reply: str = ""
+    reason: str = ""
+
+
 class IntentRecognizer:
     """
     端到端意图识别器。
@@ -114,6 +133,105 @@ class IntentRecognizer:
         self.cache_misses = 0
 
     # ── 公开接口 ──────────────────────────────────────────────────────────────
+
+    def funnel_decision(self, message: str) -> FunnelDecision:
+        """运行规则层和轻量候选层，决定是否值得升级到 LLM。
+
+        这里的分数只用于决定能否安全地走单域路径；一旦出现多领域、连接词、
+        长句或分差过小，都会升级到 ``analyze_domains``，从而保留多意图能力。
+        """
+        clean_message = self._clean_text(message).strip()
+        normalized = clean_message.lower().rstrip("。！？!?~")
+        greeting_replies = {
+            "你好": "你好！请告诉我需要查询或处理的企业服务问题。",
+            "您好": "您好！请告诉我需要查询或处理的企业服务问题。",
+            "嗨": "你好！请告诉我需要查询或处理的企业服务问题。",
+            "hi": "Hi！请告诉我需要查询或处理的企业服务问题。",
+            "hello": "Hello！请告诉我需要查询或处理的企业服务问题。",
+        }
+        if normalized in greeting_replies:
+            return FunnelDecision(
+                FunnelDecisionKind.DIRECT_REPLY,
+                reply=greeting_replies[normalized],
+                reason="精确寒暄规则",
+            )
+
+        analysis = self.lightweight_domain_analysis(clean_message)
+        credible = [item for item in analysis.candidates if item.score >= 0.55]
+        if not credible:
+            return FunnelDecision(FunnelDecisionKind.ESCALATE, analysis, reason="轻量候选置信度低")
+
+        # 领域候选一旦超过一个，必须由 LLM 根据原文证据判断是否真的是多个任务。
+        if len(credible) > 1:
+            return FunnelDecision(FunnelDecisionKind.ESCALATE, analysis, reason="存在多个可信业务领域")
+
+        task_connectors = ("同时", "另外", "并且", "以及", "先", "再", "然后", "之后", "如果", "若")
+        if any(connector in clean_message for connector in task_connectors):
+            return FunnelDecision(FunnelDecisionKind.ESCALATE, analysis, reason="消息含任务连接或条件关系")
+        if len(clean_message) > 80:
+            return FunnelDecision(FunnelDecisionKind.ESCALATE, analysis, reason="消息较长，需理解完整上下文")
+
+        top = credible[0]
+        runner_up = next((item for item in analysis.candidates if item.domain != top.domain), None)
+        if runner_up and top.score - runner_up.score < 0.15:
+            return FunnelDecision(FunnelDecisionKind.ESCALATE, analysis, reason="候选领域分差过小")
+        return FunnelDecision(FunnelDecisionKind.LIGHTWEIGHT, analysis, reason="单一高置信领域")
+
+    def lightweight_domain_analysis(self, message: str) -> DomainAnalysis:
+        """用关键词模板与本地字符 n-gram 返回四个领域的候选。
+
+        该方法完全本地运行，既不访问模型，也不依赖 ``IntentRecognizer`` 的
+        初始化状态，因而可作为低成本、可测试的漏斗第二层。
+        """
+        text = self._clean_text(message).strip()
+        msg_lower = text.lower()
+        keyword_patterns = {
+            BusinessDomain.TECHNICAL: [
+                "vpn", "网络", "报错", "错误", "崩溃", "401", "403", "500", "服务器",
+                "系统", "终端", "软件", "电脑", "无法连接",
+            ],
+            BusinessDomain.BILLING: [
+                "报销", "发票", "退款", "扣款", "费用", "薪资", "付款", "金额", "审核", "到账",
+            ],
+            BusinessDomain.ACCOUNT: [
+                "密码", "手机号", "身份验证", "验证器", "账号锁定", "注销", "登录名", "账号", "账户", "重置",
+            ],
+            BusinessDomain.GENERAL: [
+                "制度", "年假", "会议室", "入职", "办公地点", "流程", "政策", "福利", "审批",
+            ],
+        }
+        templates = {
+            BusinessDomain.TECHNICAL: _TEMPLATES[IntentCategory.TECHNICAL],
+            BusinessDomain.BILLING: _TEMPLATES[IntentCategory.BILLING],
+            BusinessDomain.ACCOUNT: _TEMPLATES[IntentCategory.ACCOUNT],
+            BusinessDomain.GENERAL: _TEMPLATES[IntentCategory.QUERY] + _TEMPLATES[IntentCategory.REQUEST],
+        }
+        message_vector = self._local_embedding(msg_lower)
+        candidates: List[DomainCandidate] = []
+        for domain in BusinessDomain:
+            keywords = keyword_patterns[domain]
+            hits = [keyword for keyword in keywords if keyword in msg_lower]
+            keyword_score = min(0.95, 0.55 + 0.10 * len(hits)) if hits else 0.0
+            ngram_similarity = max(
+                (_cosine(message_vector, self._local_embedding(template)) for template in templates[domain]),
+                default=0.0,
+            )
+            # 仅在与领域模板高度相似时让 n-gram 独立形成候选，避免哈希碰撞放大噪声。
+            template_score = 0.40 + 0.60 * ngram_similarity if ngram_similarity >= 0.72 else 0.0
+            score = max(keyword_score, template_score)
+            # 轻量单域路径会把 evidence 直接传给 Agent，因此必须保留完整原文，
+            # 不能只传递命中的几个关键词而丢失问题、对象和限定条件。
+            evidence = text if (hits or template_score) else ""
+            candidates.append(DomainCandidate(domain, min(1.0, score), evidence))
+
+        candidates.sort(key=lambda item: item.score, reverse=True)
+        return DomainAnalysis(
+            candidates=tuple(candidates),
+            modifiers={
+                "source": "lightweight_funnel",
+                "urgency": self._urgency(text, IntentCategory.OTHER).name.lower(),
+            },
+        )
 
     async def recognize(
         self,
@@ -163,6 +281,107 @@ class IntentRecognizer:
                 del self._cache[k]
         self._cache[key] = result
         return result
+
+    async def analyze_domains(
+        self,
+        message: str,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> DomainAnalysis:
+        """返回四个可执行业务领域的候选，而不是过早收敛为单一意图。"""
+        llm_candidates = await self._llm_domain_candidates(message, history)
+        pattern_scores = self._pattern_domain_scores(message)
+
+        candidates: List[DomainCandidate] = []
+        for domain in BusinessDomain:
+            llm = llm_candidates.get(domain, DomainCandidate(domain, 0.0, ""))
+            score = max(llm.score, pattern_scores.get(domain, 0.0))
+            candidates.append(DomainCandidate(
+                domain=domain,
+                score=max(0.0, min(1.0, score)),
+                evidence=llm.evidence,
+            ))
+
+        candidates.sort(key=lambda item: item.score, reverse=True)
+        urgency = self._urgency(message, IntentCategory.OTHER)
+        message_lower = message.lower()
+        return DomainAnalysis(
+            candidates=tuple(candidates),
+            modifiers={
+                "urgency": urgency.name.lower() if urgency else "low",
+                "complaint": any(word in message_lower for word in ["投诉", "太差", "糟糕", "不满"]),
+                "escalation_requested": any(word in message_lower for word in ["转人工", "找经理", "升级处理"]),
+            },
+        )
+
+    async def _llm_domain_candidates(
+        self,
+        message: str,
+        history: Optional[List[Dict[str, str]]],
+    ) -> Dict[BusinessDomain, DomainCandidate]:
+        """让 LLM 保留多领域候选及其对应的用户原文证据。"""
+        safe_message = self._clean_text(message)
+        history_text = "\n".join(
+            f"{self._clean_text(item.get('role', 'user'))}: {self._clean_text(item.get('content', ''))}"
+            for item in (history or [])[-3:]
+        )
+        prompt = f"""你是企业服务领域识别器。只评估四个可执行领域：
+- general：制度、通用流程、非技术非财务非账户服务
+- technical：IT 系统、VPN、网络、终端、错误码和技术权限
+- billing：报销、发票、费用、付款和财务审批
+- account：密码、身份验证、账户资料和账号锁定
+
+最近对话：
+{history_text}
+用户消息：{safe_message}
+
+返回严格 JSON：
+{{"candidates":[{{"domain":"technical","score":0.0,"evidence":"用户原文中的连续片段"}}]}}
+必须返回四个领域各一项，score 范围为 0 到 1。evidence 为空字符串表示该领域不相关。不要把投诉、紧急、转人工当作独立领域。"""
+        try:
+            response = await self.client.messages.create(
+                model=self.model,
+                max_tokens=384,
+                temperature=0.0,
+                messages=[{"role": "user", "content": self._clean_text(prompt)}],
+            )
+            raw = response.content[0].text
+            start, end = raw.find("{"), raw.rfind("}") + 1
+            payload = json.loads(raw[start:end])
+            items = payload.get("candidates", []) if isinstance(payload, dict) else []
+            result: Dict[BusinessDomain, DomainCandidate] = {}
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    domain = BusinessDomain(str(item.get("domain", "")))
+                    score = float(item.get("score", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                result[domain] = DomainCandidate(
+                    domain,
+                    max(0.0, min(1.0, score)),
+                    self._clean_text(item.get("evidence", "")).strip(),
+                )
+            return result
+        except Exception as ex:
+            logger.warning(f"多领域识别失败: {ex}")
+            return {}
+
+    @staticmethod
+    def _pattern_domain_scores(message: str) -> Dict[BusinessDomain, float]:
+        """确定性关键词仅作为候选补充，避免单一关键词直接决定最终路由。"""
+        msg = (message or "").lower()
+        patterns = {
+            BusinessDomain.TECHNICAL: ["vpn", "网络", "报错", "错误", "崩溃", "401", "403", "500", "服务器"],
+            BusinessDomain.BILLING: ["报销", "发票", "退款", "扣款", "费用", "薪资", "付款", "金额"],
+            BusinessDomain.ACCOUNT: ["密码", "手机号", "身份验证", "验证器", "账号锁定", "注销", "登录名"],
+            BusinessDomain.GENERAL: ["制度", "年假", "会议室", "入职", "办公地点", "流程", "政策"],
+        }
+        return {
+            domain: min(0.95, 0.55 + 0.10 * sum(keyword in msg for keyword in keywords))
+            if any(keyword in msg for keyword in keywords) else 0.0
+            for domain, keywords in patterns.items()
+        }
 
     def learn(self, message: str, correct: IntentCategory) -> None:
         """在线学习：将纠正样本加入模板，清除对应 Embedding 缓存。"""
