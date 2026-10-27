@@ -6,6 +6,25 @@ from enum import Enum
 from typing import Any
 
 
+EXPENSE_TYPES = {
+    "hotel": "hotel", "酒店": "hotel", "住宿": "hotel", "住宿费": "hotel",
+    "transport": "transport", "交通": "transport", "交通费": "transport",
+    "meal": "meal", "meals": "meal", "餐饮": "meal", "餐费": "meal",
+}
+
+
+def canonical_expense_type(value: Any) -> str | None:
+    return EXPENSE_TYPES.get(value.strip().lower()) if isinstance(value, str) else None
+
+
+def is_explicit_submission(message: Any) -> bool:
+    """Accept complete confirmation utterances, never substrings or model evidence."""
+    return isinstance(message, str) and message.strip().rstrip("。！!").strip() in {
+        "确认提交", "确认提交报销", "确认提交这笔报销", "确认提交这笔报销单",
+        "我确认提交这笔报销", "请提交这笔报销", "确认提交报销单",
+    }
+
+
 class ClaimState(str, Enum):
     COLLECTING_INFO = "collecting_info"
     DRAFT_CREATED = "draft_created"

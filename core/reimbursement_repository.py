@@ -30,6 +30,8 @@ class InMemoryReimbursementRepository:
         self._cases: dict[str, ReimbursementCase] = {}
         self._active_cases: dict[tuple[str, str], str] = {}
         self._idempotency_results: dict[str, dict[str, Any]] = {}
+        self._write_payloads: dict[tuple[str, str, str], Any] = {}
+        self._write_results: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._reserved_amounts: dict[str, float] = {}
         self._lock = asyncio.Lock()
 
@@ -139,11 +141,35 @@ class InMemoryReimbursementRepository:
             self._idempotency_results[key] = deepcopy(result)
             return deepcopy(result)
 
-    async def review_claim(self, case_id: str, approved: bool) -> ReimbursementCase:
-        """Approve or reject using the current stored state under one lock."""
+    async def atomic_write(
+        self, case_id: str, action: str, idempotency_key: str,
+        mutate: Callable[[ReimbursementCase], dict[str, Any]], *,
+        payload: Any = None, owner: tuple[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Authenticate, replay or commit the mutation under the same lock."""
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError("缺少有效幂等键")
         async with self._lock:
-            case = self._cases.get(case_id)
-            if case is None or case.state != ClaimState.SUBMITTED or not case.budget_reserved:
+            stored = self._cases.get(case_id)
+            if stored is None or (owner is not None and owner != (stored.user_id, stored.conv_id)):
+                raise ValueError("报销单不存在或无权访问")
+            key = (case_id, action, idempotency_key)
+            if key in self._write_results:
+                if self._write_payloads[key] != payload:
+                    raise ValueError("幂等键已用于不同的请求")
+                return deepcopy(self._write_results[key])
+            case = deepcopy(stored)
+            result = mutate(case)
+            case.version = stored.version + int(case != stored)
+            self._cases[case_id] = case
+            self._write_payloads[key] = deepcopy(payload)
+            self._write_results[key] = deepcopy(result)
+            return deepcopy(result)
+
+    async def review_claim(self, case_id: str, approved: bool, idempotency_key: str) -> dict[str, Any]:
+        """Approve or reject using the current stored state under one lock."""
+        def mutate(case):
+            if case.state != ClaimState.SUBMITTED or not case.budget_reserved:
                 raise ValueError("报销单尚未提交或预算已经释放")
             if approved:
                 case.validation["review_approved"] = True
@@ -153,16 +179,16 @@ class InMemoryReimbursementRepository:
                 case.budget_reserved = False
                 case.validation.pop("review_approved", None)
                 case.state = ClaimState.REWORK_REQUIRED
-            case.version += 1
-            return deepcopy(case)
+            return {"case_id": case.case_id, "approved": approved, "state": case.state.value}
+        return await self.atomic_write(case_id, "review_claim", idempotency_key, mutate,
+                                       payload={"approved": approved})
 
-    async def mark_paid(self, case_id: str) -> ReimbursementCase:
+    async def mark_paid(self, case_id: str, idempotency_key: str) -> dict[str, Any]:
         """Pay only an approved, still-reserved submission under the lock."""
-        async with self._lock:
-            case = self._cases.get(case_id)
-            if (case is None or case.state != ClaimState.SUBMITTED
+        def mutate(case):
+            if (case.state != ClaimState.SUBMITTED
                     or not case.budget_reserved or not case.validation.get("review_approved")):
                 raise ValueError("报销单尚未审核通过")
             case.state = ClaimState.PAID
-            case.version += 1
-            return deepcopy(case)
+            return {"case_id": case.case_id, "state": case.state.value, "claim_no": case.claim_no}
+        return await self.atomic_write(case_id, "simulate_payment", idempotency_key, mutate)

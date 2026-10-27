@@ -59,7 +59,7 @@ class BillingDecisionTests(unittest.IsolatedAsyncioTestCase):
     async def test_structured_decision_uses_no_tools_and_known_facts(self):
         content = [{"type": "text", "text": json.dumps({
             "facts": {"trip_city": "上海", "trip_date": "2026-10-20",
-                      "project_code": "PRJ-001", "expenses": [{"type": "hotel", "amount": 600}],
+                      "project_code": "PRJ-001", "expenses": [{"type": "hotel", "amount": 600, "receipt_present": True}],
                       "secret": "ignored"},
             "action": "validate", "explicit_confirmation": False,
         }, ensure_ascii=False)}]
@@ -72,7 +72,7 @@ class BillingDecisionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(decision.action, ReimbursementAction.VALIDATE)
         self.assertEqual(decision.facts["trip_city"], "上海")
-        self.assertEqual(decision.facts["expenses"], [{"type": "hotel", "amount": 600}])
+        self.assertEqual(decision.facts["expenses"], [{"type": "hotel", "amount": 600, "receipt_present": True}])
         self.assertNotIn("secret", decision.facts)
         self.assertFalse(decision.explicit_confirmation)
         self.assertEqual(decision.user_message, req.message)

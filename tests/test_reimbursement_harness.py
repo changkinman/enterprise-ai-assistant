@@ -13,7 +13,7 @@ from tools.loader import discover_agent_tools
 
 
 FACTS = {"trip_city": "上海", "trip_date": "2026-10-20", "project_code": "P1",
-         "expenses": [{"type": "hotel", "amount": 600}]}
+         "expenses": [{"type": "hotel", "amount": 600, "receipt_present": True}]}
 
 
 class DecisionProvider:
@@ -52,7 +52,7 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_project_code_keeps_case_and_asks_one_question(self):
         result = await self.decide({"trip_city": "上海", "trip_date": "2026-10-20",
-                                    "expenses": [{"type": "hotel", "amount": 600}]})
+                                    "expenses": [{"type": "hotel", "amount": 600, "receipt_present": True}]})
         self.assertIn("项目", result.content)
         self.assertEqual(result.content.count("？"), 1)
         self.assertEqual(result.case.state, ClaimState.COLLECTING_INFO)
@@ -83,11 +83,11 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_changed_expense_in_confirmation_requires_new_validation_and_confirmation(self):
         await self.ready()
-        changed = await self.decide({"expenses": [{"type": "hotel", "amount": 700}]},
+        changed = await self.decide({"expenses": [{"type": "hotel", "amount": 700, "receipt_present": True}]},
                                     ReimbursementAction.CONFIRM_SUBMIT, confirmed=True,
                                     message="酒店改成 700，确认提交")
         self.assertEqual(changed.case.state, ClaimState.AWAITING_CONFIRMATION)
-        self.assertEqual(changed.case.expenses, [{"type": "hotel", "amount": 700}])
+        self.assertEqual(changed.case.expenses, [{"type": "hotel", "amount": 700, "receipt_present": True}])
         self.assertIn("700", changed.content)
         self.assertFalse(any(trace.tool_name == "submit_claim" for trace in changed.tool_calls))
         self.assertEqual(await self.repo.remaining_budget("engineering"), 3000)
@@ -99,7 +99,7 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_revalidation_after_changed_confirmation_cannot_submit(self):
         await self.ready()
         self.manager.unregister("search_policy")
-        changed = await self.decide({"expenses": [{"type": "hotel", "amount": 700}]},
+        changed = await self.decide({"expenses": [{"type": "hotel", "amount": 700, "receipt_present": True}]},
                                     ReimbursementAction.CONFIRM_SUBMIT, confirmed=True)
         self.assertFalse(changed.success)
         self.assertEqual(changed.case.state, ClaimState.REWORK_REQUIRED)
@@ -145,17 +145,17 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.repo.remaining_budget("engineering"), 2400)
 
     async def test_invalid_hotel_limit_reworks_and_can_replace_expenses(self):
-        bad = await self.decide({**FACTS, "expenses": [{"type": "hotel", "amount": 900}]},
+        bad = await self.decide({**FACTS, "expenses": [{"type": "hotel", "amount": 900, "receipt_present": True}]},
                                 ReimbursementAction.VALIDATE)
         self.assertEqual(bad.case.state, ClaimState.REWORK_REQUIRED)
         self.assertIn("酒店", bad.content)
-        fixed = await self.decide({"expenses": [{"type": "hotel", "amount": 700}]},
+        fixed = await self.decide({"expenses": [{"type": "hotel", "amount": 700, "receipt_present": True}]},
                                   ReimbursementAction.VALIDATE)
         self.assertEqual(fixed.case.state, ClaimState.AWAITING_CONFIRMATION, fixed.content)
-        self.assertEqual(fixed.case.expenses, [{"type": "hotel", "amount": 700}])
+        self.assertEqual(fixed.case.expenses, [{"type": "hotel", "amount": 700, "receipt_present": True}])
 
     async def test_insufficient_budget_reworks_before_confirmation(self):
-        result = await self.decide({**FACTS, "expenses": [{"type": "transport", "amount": 3200}]},
+        result = await self.decide({**FACTS, "expenses": [{"type": "transport", "amount": 3200, "receipt_present": True}]},
                                    ReimbursementAction.VALIDATE)
         self.assertEqual(result.case.state, ClaimState.REWORK_REQUIRED)
         self.assertIn("预算", result.content)
@@ -187,7 +187,8 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rejected["state"], "rework_required")
         self.assertEqual(await self.repo.remaining_budget("engineering"), 3000)
         await self.decide({}, ReimbursementAction.VALIDATE)
-        resubmitted = await self.decide({}, ReimbursementAction.CONFIRM_SUBMIT, confirmed=True)
+        resubmitted = await self.decide({}, ReimbursementAction.CONFIRM_SUBMIT, confirmed=True,
+                                        message="确认提交这笔报销")
         self.assertEqual(resubmitted.case.state, ClaimState.SUBMITTED)
         approved = await self.harness.review_claim(submitted.case.case_id, "manager-001", True)
         self.assertEqual(approved["state"], "submitted")

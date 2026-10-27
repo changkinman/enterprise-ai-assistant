@@ -9,6 +9,7 @@ from uuid import uuid4
 from core.reimbursement_models import (
     ClaimState, HarnessResult, HarnessToolTrace, ReimbursementAction,
     ReimbursementCase, ReimbursementDecision, append_event,
+    canonical_expense_type, is_explicit_submission,
 )
 from core.reimbursement_repository import InMemoryReimbursementRepository
 from mcp.tool_manager import MCPToolManager
@@ -67,6 +68,10 @@ class ReimbursementCaseHarness:
 
     async def _call(self, case: ReimbursementCase, name: str, arguments: dict[str, Any],
                     context: dict[str, Any], traces: list[HarnessToolTrace]) -> tuple[ReimbursementCase, bool, Any]:
+        if name in {"create_draft", "add_expense_items", "validate_claim", "submit_claim",
+                    "review_claim", "simulate_payment"}:
+            arguments = {"case_id": case.case_id,
+                         "idempotency_key": f"{case.case_id}:{name}:{case.version}", **arguments}
         try:
             result = await self.tool_manager.call(name, arguments, context,
                                                   caller_agent="billing", use_cache=False)
@@ -113,7 +118,9 @@ class ReimbursementCaseHarness:
                 if (isinstance(kind, str) and kind.strip()
                         and isinstance(amount, (int, float)) and not isinstance(amount, bool)
                         and math.isfinite(amount) and amount > 0):
-                    cleaned.append({"type": kind.strip(), "amount": amount})
+                    cleaned.append({"type": canonical_expense_type(kind) or kind.strip(),
+                                    "amount": amount,
+                                    "receipt_present": item.get("receipt_present") is True})
             if cleaned:
                 expenses = cleaned
         return facts, expenses
@@ -176,7 +183,10 @@ class ReimbursementCaseHarness:
             if changed:
                 # A confirmation containing new data confirms neither the old nor the new version.
                 action = ReimbursementAction.COLLECT_FACTS
-            elif decision.explicit_confirmation is not True:
+            elif (decision.explicit_confirmation is not True
+                  or not is_explicit_submission(getattr(req, "original_message", None)
+                                                if getattr(req, "original_message", None) is not None
+                                                else req.message)):
                 self._stats["state_rejections"] += 1
                 case = await self._event(case, "state_rejection", {"reason": "confirmation_not_explicit"})
                 return HarnessResult("请明确回复“确认提交这笔报销”后再提交。", case, traces, True)

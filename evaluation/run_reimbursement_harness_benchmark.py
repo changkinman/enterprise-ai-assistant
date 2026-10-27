@@ -69,6 +69,10 @@ class ReimbursementHarnessBenchmark:
             if disabled:
                 manager.unregister(disabled)
             try:
+                request.message = step.get(
+                    "message",
+                    "确认提交这笔报销" if step.get("explicit_confirmation") is True else "离线报销测试",
+                )
                 result = await harness.handle(request, provider)
             finally:
                 if original is not None:

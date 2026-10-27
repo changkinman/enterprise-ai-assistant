@@ -34,7 +34,7 @@ from monitor.performance_monitor import PerformanceMonitor
 class BenchmarkTests(unittest.IsolatedAsyncioTestCase):
     async def test_benchmark_reports_confirmation_safety(self):
         facts = {"trip_city": "上海", "trip_date": "2026-10-20", "project_code": "P1",
-                 "expenses": [{"type": "hotel", "amount": 600}]}
+                 "expenses": [{"type": "hotel", "amount": 600, "receipt_present": True}]}
         cases = [
             {"id": "complete", "steps": [
                 {"action": "validate", "facts": facts},

@@ -100,6 +100,7 @@ class Request:
     intent:      Optional[IntentCategory] = None
     urgency:     Optional[UrgencyLevel]   = None
     request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    original_message: Optional[str] = None  # Trusted raw turn, preserved across task decomposition.
 
 
 @dataclass
@@ -361,7 +362,9 @@ class BillingAgent(BaseAgent):
             self.system_prompt
             + "只返回一个 JSON 对象，字段必须是 facts、action、explicit_confirmation。"
               "facts 只能包含 trip_city、trip_date、project_code、expenses；"
-              "expenses 必须是由 type 和 amount 组成的对象数组。"
+              "expenses 必须是由 type、amount、receipt_present 组成的对象数组。"
+              "type 只能是 hotel（酒店/住宿）、transport（交通）、meal（餐费）。"
+              "receipt_present 仅在员工明确表示有票据时为 true，缺票或未说明时为 false。"
               "action 只能是 collect_facts、validate、confirm_submit、get_status。"
               "只有员工在本轮明确要求提交这笔报销时，explicit_confirmation 才能为 true；"
               "其他情况必须为 false。不要返回 Markdown 或额外说明。"
@@ -540,6 +543,7 @@ class AgentOrchestrator:
         task_req = replace(
             req,
             message=task.evidence,
+            original_message=req.original_message if req.original_message is not None else req.message,
             context=context,
             intent=self._intent_for_domain(task.domain),
         )

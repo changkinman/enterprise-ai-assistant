@@ -28,7 +28,8 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
         case = await self.repo.get_or_create_active_case("emp-001", "conv-1")
         case.state = ClaimState.AWAITING_CONFIRMATION
         case.facts = {"trip_city": "上海", "trip_date": "2026-10-20", "project_code": "P1"}
-        case.expenses = expenses or [{"type": "hotel", "amount": 700.0}, {"type": "transport", "amount": 100.0}]
+        case.expenses = expenses or [{"type": "hotel", "amount": 700.0, "receipt_present": True},
+                                     {"type": "transport", "amount": 100.0, "receipt_present": True}]
         return await self.repo.save_case(case)
 
     async def test_submission_requires_trusted_confirmation(self):
@@ -52,16 +53,16 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stored.budget_reserved)
 
     async def test_permission_schema_limit_and_budget_rejections(self):
-        case = await self.ready_case([{"type": "hotel", "amount": 900.0}])
+        case = await self.ready_case([{"type": "hotel", "amount": 900.0, "receipt_present": True}])
         denied = await self.call("get_case", {"case_id": case.case_id}, agent="technical")
         missing = await self.call("get_case", {})
-        validation = await self.call("validate_claim", {"case_id": case.case_id})
+        validation = await self.call("validate_claim", {"case_id": case.case_id, "idempotency_key": "validate-limit"})
         self.assertFalse(denied.success)
         self.assertFalse(missing.success)
         self.assertFalse(validation.data["valid"])
         self.assertIn("hotel_over_limit", [issue["code"] for issue in validation.data["issues"]])
 
-        case.expenses = [{"type": "transport", "amount": 3200.0}]
+        case.expenses = [{"type": "transport", "amount": 3200.0, "receipt_present": True}]
         await self.repo.save_case(case)
         insufficient = await self.call("submit_claim", {"case_id": case.case_id, "idempotency_key": "k2"}, {**CONTEXT, "confirmed": True})
         self.assertFalse(insufficient.success)
@@ -71,12 +72,15 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
     async def test_read_tools_and_draft_workflow(self):
         policy = await self.call("search_policy", {"city": "上海"})
         self.assertEqual(policy.data["hotel_limit"], 800.0)
-        draft = await self.call("create_draft", {"facts": {"trip_city": "上海", "trip_date": "2026-10-20", "project_code": "P1"}})
+        case = await self.repo.get_or_create_active_case("emp-001", "conv-1")
+        draft = await self.call("create_draft", {"case_id": case.case_id, "idempotency_key": "draft-1",
+            "facts": {"trip_city": "上海", "trip_date": "2026-10-20", "project_code": "P1"}})
         self.assertTrue(draft.success, draft.error)
         case_id = draft.data["case_id"]
-        added = await self.call("add_expense_items", {"case_id": case_id, "items": [{"type": "hotel", "amount": 700.0}]})
+        added = await self.call("add_expense_items", {"case_id": case_id, "idempotency_key": "items-1",
+            "items": [{"type": "hotel", "amount": 700.0, "receipt_present": True}]})
         self.assertTrue(added.success, added.error)
-        validation = await self.call("validate_claim", {"case_id": case_id})
+        validation = await self.call("validate_claim", {"case_id": case_id, "idempotency_key": "validate-1"})
         self.assertTrue(validation.data["valid"])
         self.assertEqual(validation.data["total_amount"], 700.0)
         self.assertEqual((await self.call("get_case", {"case_id": case_id})).data["state"], "awaiting_confirmation")
@@ -92,11 +96,11 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
         case = await self.ready_case()
         await self.call("submit_claim", {"case_id": case.case_id, "idempotency_key": "k1"}, {**CONTEXT, "confirmed": True})
         finance = {"user_id": "finance-001", "conv_id": "conv-1", "agent_type": "billing"}
-        payment = await self.call("simulate_payment", {"case_id": case.case_id}, finance)
+        payment = await self.call("simulate_payment", {"case_id": case.case_id, "idempotency_key": "pay-1"}, finance)
         self.assertFalse(payment.success)
-        reviewed = await self.call("review_claim", {"case_id": case.case_id, "approved": True}, finance)
+        reviewed = await self.call("review_claim", {"case_id": case.case_id, "idempotency_key": "review-1", "approved": True}, finance)
         self.assertTrue(reviewed.success)
-        paid = await self.call("simulate_payment", {"case_id": case.case_id}, finance)
+        paid = await self.call("simulate_payment", {"case_id": case.case_id, "idempotency_key": "pay-2"}, finance)
         self.assertTrue(paid.success)
         self.assertEqual(paid.data["state"], "paid")
 
@@ -107,8 +111,8 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
         first = await self.call("submit_claim", params, confirmed)
         self.assertTrue(first.success)
         finance = {"user_id": "finance-001", "conv_id": "conv-1"}
-        self.assertTrue((await self.call("review_claim", {"case_id": case.case_id, "approved": True}, finance)).success)
-        self.assertTrue((await self.call("simulate_payment", {"case_id": case.case_id}, finance)).success)
+        self.assertTrue((await self.call("review_claim", {"case_id": case.case_id, "idempotency_key": "review-paid", "approved": True}, finance)).success)
+        self.assertTrue((await self.call("simulate_payment", {"case_id": case.case_id, "idempotency_key": "payment-paid"}, finance)).success)
         before = await self.repo.remaining_budget("engineering")
         replay = await self.call("submit_claim", params, confirmed)
         self.assertTrue(replay.success, replay.error)
@@ -145,13 +149,14 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first.success)
         self.assertEqual(await self.repo.remaining_budget("engineering"), 2200.0)
         reviewer = {"user_id": "manager-001", "conv_id": "conv-1"}
-        rejected = await self.call("review_claim", {"case_id": case.case_id, "approved": False}, reviewer)
-        duplicate = await self.call("review_claim", {"case_id": case.case_id, "approved": False}, reviewer)
+        rejected = await self.call("review_claim", {"case_id": case.case_id, "idempotency_key": "review-reject", "approved": False}, reviewer)
+        duplicate = await self.call("review_claim", {"case_id": case.case_id, "idempotency_key": "review-reject", "approved": False}, reviewer)
         self.assertTrue(rejected.success)
-        self.assertFalse(duplicate.success)
+        self.assertTrue(duplicate.success)
+        self.assertEqual(duplicate.data, rejected.data)
         self.assertEqual(await self.repo.remaining_budget("engineering"), 3000.0)
         self.assertFalse((await self.repo.get_case(case.case_id)).budget_reserved)
-        validated = await self.call("validate_claim", {"case_id": case.case_id})
+        validated = await self.call("validate_claim", {"case_id": case.case_id, "idempotency_key": "validate-rework"})
         self.assertTrue(validated.data["valid"])
         second = await self.call("submit_claim", {"case_id": case.case_id, "idempotency_key": "second"}, submit_context)
         self.assertTrue(second.success)
@@ -164,10 +169,10 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
         submit_context = {**CONTEXT, "confirmed": True}
         first = await self.call("submit_claim", params, submit_context)
         self.assertTrue(first.success)
-        rejected = await self.call("review_claim", {"case_id": case.case_id, "approved": False},
+        rejected = await self.call("review_claim", {"case_id": case.case_id, "idempotency_key": "reject-same", "approved": False},
                                    {"user_id": "manager-001", "conv_id": "conv-1"})
         self.assertTrue(rejected.success)
-        validated = await self.call("validate_claim", {"case_id": case.case_id})
+        validated = await self.call("validate_claim", {"case_id": case.case_id, "idempotency_key": "validate-same"})
         self.assertTrue(validated.data["valid"])
         second = await self.call("submit_claim", params, submit_context)
         self.assertTrue(second.success)
@@ -194,13 +199,13 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
 
         self.repo.save_case = delayed_save
         reviewer = {"user_id": "manager-001", "conv_id": "conv-1"}
-        approval = asyncio.create_task(self.call("review_claim", {"case_id": case.case_id, "approved": True}, reviewer))
+        approval = asyncio.create_task(self.call("review_claim", {"case_id": case.case_id, "idempotency_key": "approve-race", "approved": True}, reviewer))
         try:
             try:
                 await asyncio.wait_for(approval_at_save.wait(), timeout=0.1)
             except asyncio.TimeoutError:
                 pass  # A locked transition never calls save_case with an approval snapshot.
-            rejected = await self.call("review_claim", {"case_id": case.case_id, "approved": False}, reviewer)
+            rejected = await self.call("review_claim", {"case_id": case.case_id, "idempotency_key": "reject-race", "approved": False}, reviewer)
         finally:
             release_approval.set()
         await approval
@@ -216,7 +221,7 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
         await self.call("submit_claim", {"case_id": case.case_id, "idempotency_key": "first"},
                         {**CONTEXT, "confirmed": True})
         finance = {"user_id": "finance-001", "conv_id": "conv-1"}
-        self.assertTrue((await self.call("review_claim", {"case_id": case.case_id, "approved": True}, finance)).success)
+        self.assertTrue((await self.call("review_claim", {"case_id": case.case_id, "idempotency_key": "approve-payment-race", "approved": True}, finance)).success)
         original_save = self.repo.save_case
         payment_at_save = asyncio.Event()
         release_payment = asyncio.Event()
@@ -228,13 +233,13 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
             return await original_save(snapshot)
 
         self.repo.save_case = delayed_save
-        payment = asyncio.create_task(self.call("simulate_payment", {"case_id": case.case_id}, finance))
+        payment = asyncio.create_task(self.call("simulate_payment", {"case_id": case.case_id, "idempotency_key": "payment-race"}, finance))
         try:
             try:
                 await asyncio.wait_for(payment_at_save.wait(), timeout=0.1)
             except asyncio.TimeoutError:
                 pass  # A locked payment transition does not call save_case.
-            await self.call("review_claim", {"case_id": case.case_id, "approved": False}, finance)
+            await self.call("review_claim", {"case_id": case.case_id, "idempotency_key": "reject-payment-race", "approved": False}, finance)
         finally:
             release_payment.set()
         await payment
@@ -252,9 +257,9 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
                 case = await repo.get_or_create_active_case("emp-001", "conv-1")
                 case.state = ClaimState.AWAITING_CONFIRMATION
                 case.facts = {"trip_city": "上海", "trip_date": "2026-10-20", "project_code": "P1"}
-                case.expenses = [{"type": "transport", "amount": amount}]
+                case.expenses = [{"type": "transport", "amount": amount, "receipt_present": True}]
                 await repo.save_case(case)
-                validation = await manager.call("validate_claim", {"case_id": case.case_id}, CONTEXT, caller_agent="billing")
+                validation = await manager.call("validate_claim", {"case_id": case.case_id, "idempotency_key": f"validate-{amount}"}, CONTEXT, caller_agent="billing")
                 self.assertFalse(validation.data["valid"])
                 self.assertIn("invalid_amount", [issue["code"] for issue in validation.data["issues"]])
                 submission = await manager.call("submit_claim", {"case_id": case.case_id, "idempotency_key": "x"},
