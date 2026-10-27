@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import unittest
 from types import SimpleNamespace
@@ -79,6 +80,69 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
                             for e in submitted.case.events))
         reached = {e.detail["to"] for e in submitted.case.events if e.event_type == "state_transition"}
         self.assertTrue({"draft_created", "validating", "awaiting_confirmation", "submitted"} <= reached)
+
+    async def test_changed_expense_in_confirmation_requires_new_validation_and_confirmation(self):
+        await self.ready()
+        changed = await self.decide({"expenses": [{"type": "hotel", "amount": 700}]},
+                                    ReimbursementAction.CONFIRM_SUBMIT, confirmed=True,
+                                    message="酒店改成 700，确认提交")
+        self.assertEqual(changed.case.state, ClaimState.AWAITING_CONFIRMATION)
+        self.assertEqual(changed.case.expenses, [{"type": "hotel", "amount": 700}])
+        self.assertIn("700", changed.content)
+        self.assertFalse(any(trace.tool_name == "submit_claim" for trace in changed.tool_calls))
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 3000)
+        submitted = await self.decide({}, ReimbursementAction.CONFIRM_SUBMIT, confirmed=True,
+                                      message="确认提交这笔报销")
+        self.assertEqual(submitted.case.state, ClaimState.SUBMITTED)
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 2300)
+
+    async def test_failed_revalidation_after_changed_confirmation_cannot_submit(self):
+        await self.ready()
+        self.manager.unregister("search_policy")
+        changed = await self.decide({"expenses": [{"type": "hotel", "amount": 700}]},
+                                    ReimbursementAction.CONFIRM_SUBMIT, confirmed=True)
+        self.assertFalse(changed.success)
+        self.assertEqual(changed.case.state, ClaimState.REWORK_REQUIRED)
+        blocked = await self.decide({}, ReimbursementAction.CONFIRM_SUBMIT, confirmed=True)
+        self.assertFalse(blocked.success)
+        self.assertFalse(any(trace.tool_name == "submit_claim" for trace in blocked.tool_calls))
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 3000)
+
+    async def test_concurrent_status_cannot_overwrite_submission(self):
+        await self.ready()
+        status_at_save = asyncio.Event()
+        release_status = asyncio.Event()
+        original_save = self.repo.save_case
+        status_task = None
+        held = False
+
+        async def hold_status_save(case):
+            nonlocal held
+            if asyncio.current_task() is status_task and not held:
+                held = True
+                status_at_save.set()
+                await release_status.wait()
+            return await original_save(case)
+
+        self.repo.save_case = hold_status_save
+        try:
+            status_task = asyncio.create_task(
+                self.decide({}, ReimbursementAction.GET_STATUS), name="status")
+            await asyncio.wait_for(status_at_save.wait(), timeout=1)
+            submit_task = asyncio.create_task(
+                self.decide({}, ReimbursementAction.CONFIRM_SUBMIT, confirmed=True,
+                            message="确认提交"), name="submit")
+            await asyncio.wait({submit_task}, timeout=0.1)
+            self.assertFalse(submit_task.done(), "submission must wait for the same-case status update")
+            release_status.set()
+            await asyncio.gather(status_task, submit_task)
+        finally:
+            release_status.set()
+            self.repo.save_case = original_save
+        stored = await self.repo.get_case(status_task.result().case.case_id)
+        self.assertEqual(stored.state, ClaimState.SUBMITTED)
+        self.assertTrue(stored.budget_reserved)
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 2400)
 
     async def test_invalid_hotel_limit_reworks_and_can_replace_expenses(self):
         bad = await self.decide({**FACTS, "expenses": [{"type": "hotel", "amount": 900}]},

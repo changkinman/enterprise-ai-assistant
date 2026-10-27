@@ -1,5 +1,6 @@
 """Deterministic case workflow around governed reimbursement tools."""
 
+import asyncio
 from dataclasses import asdict
 from copy import deepcopy
 import math
@@ -43,6 +44,10 @@ class ReimbursementCaseHarness:
         self._stats = {"completed": 0, "clarifications": 0, "state_rejections": 0,
                        "tool_failure_recoveries": 0, "confirmations": 0}
         self._conversation_cases: dict[tuple[str, str], str] = {}
+        self._case_locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, case_id: str) -> asyncio.Lock:
+        return self._case_locks.setdefault(case_id, asyncio.Lock())
 
     def stats(self) -> dict[str, int]:
         return dict(self._stats)
@@ -121,6 +126,12 @@ class ReimbursementCaseHarness:
         if case is None:
             case = await self.repository.get_or_create_active_case(*conversation)
         self._conversation_cases[conversation] = case.case_id
+        async with self._lock_for(case.case_id):
+            current = await self.repository.get_case(case.case_id)
+            return await self._handle_locked(req, agent, current)
+
+    async def _handle_locked(self, req: Any, agent: Any,
+                             case: ReimbursementCase) -> HarnessResult:
         traces: list[HarnessToolTrace] = []
         start_state = case.state
         decision = await agent.decide_reimbursement(req, deepcopy(case))
@@ -145,22 +156,42 @@ class ReimbursementCaseHarness:
                 return await self._failed(case, traces, start_state)
             return HarnessResult(f"报销单状态：{data['state']}。", case, traces, True)
 
+        facts, expenses = self._clean_facts(decision.facts)
         if action == ReimbursementAction.CONFIRM_SUBMIT:
-            if decision.explicit_confirmation is not True:
+            supplied = decision.facts if isinstance(decision.facts, dict) else {}
+            invalid_material = not isinstance(decision.facts, dict)
+            invalid_material = invalid_material or any(
+                key in supplied and key not in facts for key in REQUIRED_FACTS
+            )
+            if "expenses" in supplied:
+                raw_expenses = supplied["expenses"]
+                if (not isinstance(raw_expenses, list) or expenses is None
+                        or len(expenses) != len(raw_expenses)):
+                    invalid_material = True
+            if invalid_material:
+                self._stats["state_rejections"] += 1
+                case = await self._event(case, "state_rejection", {"reason": "invalid_confirmation_facts"})
+                return HarnessResult("修改的信息无效，请重新提供后确认提交。", case, traces, False)
+            changed = (any(case.facts.get(key) != value for key, value in facts.items())
+                       or (expenses is not None and expenses != case.expenses))
+            if changed:
+                # A confirmation containing new data confirms neither the old nor the new version.
+                action = ReimbursementAction.COLLECT_FACTS
+            elif decision.explicit_confirmation is not True:
                 self._stats["state_rejections"] += 1
                 case = await self._event(case, "state_rejection", {"reason": "confirmation_not_explicit"})
                 return HarnessResult("请明确回复“确认提交这笔报销”后再提交。", case, traces, True)
-            key = f"{case.case_id}:submit:{case.version}"
-            case, ok, data = await self._call(case, "submit_claim",
-                                              {"case_id": case.case_id, "idempotency_key": key},
-                                              {**context, "confirmed": True}, traces)
-            if not ok:
-                return await self._failed(case, traces, start_state)
-            self._stats["confirmations"] += 1
-            self._stats["completed"] += 1
-            return HarnessResult(f"报销单已提交，单号 {data['claim_no']}。", case, traces, True)
+            else:
+                key = f"{case.case_id}:submit:{case.version}"
+                case, ok, data = await self._call(case, "submit_claim",
+                                                  {"case_id": case.case_id, "idempotency_key": key},
+                                                  {**context, "confirmed": True}, traces)
+                if not ok:
+                    return await self._failed(case, traces, start_state)
+                self._stats["confirmations"] += 1
+                self._stats["completed"] += 1
+                return HarnessResult(f"报销单已提交，单号 {data['claim_no']}。", case, traces, True)
 
-        facts, expenses = self._clean_facts(decision.facts)
         if facts or expenses is not None:
             case.facts.update(facts)
             if expenses is not None:
@@ -171,6 +202,8 @@ class ReimbursementCaseHarness:
                                                                "expenses": expenses is not None})
             if start_state == ClaimState.AWAITING_CONFIRMATION:
                 case = await self._transition(case, ClaimState.REWORK_REQUIRED, "facts_changed")
+                # The prior confirmation no longer covers the revised data.
+                start_state = ClaimState.REWORK_REQUIRED
 
         missing = next((key for key in (*REQUIRED_FACTS, "expenses")
                         if not (case.expenses if key == "expenses" else case.facts.get(key))), None)
@@ -241,6 +274,11 @@ class ReimbursementCaseHarness:
 
     async def review_claim(self, case_id: str, reviewer_id: str, approved: bool,
                            comment: str = "") -> dict[str, Any]:
+        async with self._lock_for(case_id):
+            return await self._review_locked(case_id, reviewer_id, approved, comment)
+
+    async def _review_locked(self, case_id: str, reviewer_id: str, approved: bool,
+                             comment: str) -> dict[str, Any]:
         case = await self.repository.get_case(case_id)
         if case is None:
             raise ValueError("报销单不存在")
@@ -262,6 +300,10 @@ class ReimbursementCaseHarness:
         return data
 
     async def simulate_payment(self, case_id: str, finance_user_id: str) -> dict[str, Any]:
+        async with self._lock_for(case_id):
+            return await self._payment_locked(case_id, finance_user_id)
+
+    async def _payment_locked(self, case_id: str, finance_user_id: str) -> dict[str, Any]:
         case = await self.repository.get_case(case_id)
         if case is None:
             raise ValueError("报销单不存在")
