@@ -149,6 +149,10 @@ class PerformanceMonitor:
             "tool_success_rate":  Gauge("tool_success_rate", "工具成功率", ["tool"]),
             "requests_total":     Counter("requests_total", "总请求数"),
         }
+        for metric in ("completed", "clarifications", "state_rejections",
+                       "tool_failure_recoveries", "confirmations"):
+            name = f"reimbursement_harness_{metric}"
+            self._prom[name] = Gauge(name, f"Reimbursement Harness {metric}")
         start_http_server(port)
         logger.info(f"Prometheus 已启动: :{port}")
 
@@ -234,6 +238,13 @@ class PerformanceMonitor:
                     priority=9,
                 ))
 
+        # Harness counters are observational and do not enter routing or alert logic.
+        harness_stats = self._reimbursement_harness_stats()
+        for metric, value in harness_stats.items():
+            gauge = self._prom.get(f"reimbursement_harness_{metric}")
+            if gauge is not None:
+                gauge.set(value)
+
         # ── 路由优化建议 ──────────────────────────────────────────────────────
         updater = getattr(self._orchestrator, "update_routing_penalties", None)
         if updater:
@@ -309,9 +320,15 @@ class PerformanceMonitor:
         return {
             "agent_stats":   self._orchestrator.get_stats(),
             "tool_stats":    self._tool_manager.get_stats(),
+            "reimbursement_harness": self._reimbursement_harness_stats(),
             "active_alerts": [asdict(a) for a in self._alerts if not a.resolved][-10:],
             "suggestions":   [
                 {"title": s.title, "action": s.action, "priority": s.priority}
                 for s in sorted(self._suggestions, key=lambda x: -x.priority)[:5]
             ],
         }
+
+    def _reimbursement_harness_stats(self) -> Dict[str, int]:
+        harness = getattr(self._orchestrator, "_reimbursement_harness", None)
+        stats = getattr(harness, "stats", None)
+        return stats() if callable(stats) else {}
