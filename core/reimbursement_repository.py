@@ -110,7 +110,7 @@ class InMemoryReimbursementRepository:
             if case is None or case.user_id != user_id or case.conv_id != conv_id:
                 raise ValueError("报销单不存在或无权访问")
             prior = self._idempotency_results.get(key)
-            if (prior is not None and case.state == ClaimState.SUBMITTED
+            if (prior is not None and case.state in {ClaimState.SUBMITTED, ClaimState.PAID}
                     and case.budget_reserved and prior.get("claim_no") == case.claim_no):
                 return deepcopy(prior)
             if case.state != ClaimState.AWAITING_CONFIRMATION:

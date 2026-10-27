@@ -60,3 +60,13 @@ Fixes:
 GREEN evidence: `.venv\Scripts\python.exe -m unittest tests.test_reimbursement_tools tests.test_agent_tools tests.test_reimbursement_models_repository -v` exited 0: 33 tests run, 1 skipped (`API dependencies not installed`). `git diff --check` exited 0. The focused test run used the previously established elevated exception because sandboxed asyncio unittest had hung. No dependencies were installed.
 
 Self-review: the repository lock now covers the state read, reservation check, approval/rejection/payment mutation and version increment. The stale idempotency entry is superseded only after a new successful submission. The only remaining test limitation is the optional API serialization skip due to missing dependencies in this virtual environment.
+
+## Review fixes, round 3
+
+RED: `.venv\Scripts\python.exe -m unittest tests.test_reimbursement_tools.ReimbursementToolsTests.test_same_submission_key_replays_original_result_after_payment -v` exited 1. After submit → approve → paid, same-key submission returned a failure because the idempotency check accepted only `SUBMITTED`.
+
+Fix: `submit_claim` now replays a stored result for a matching current claim number when the case is either `SUBMITTED` or `PAID` and the reservation is still recorded. Rejected/rework cases still cannot replay the old result. The new manager-level test asserts the exact original submission result and an unchanged 2200.0 remaining budget after payment.
+
+GREEN: `.venv\Scripts\python.exe -m unittest tests.test_reimbursement_tools tests.test_agent_tools tests.test_reimbursement_models_repository -v` exited 0: 34 tests run, 1 skipped (`API dependencies not installed`). `git diff --check` exited 0. Focused asyncio tests used the previously documented elevated exception after sandboxed unittest had hung; no dependencies were installed.
+
+Self-review: the replay condition still checks case ownership before result lookup, requires the current claim number to match, and requires `budget_reserved=True`; a refunded rejection is excluded. The remaining test limitation is the optional API serialization skip.

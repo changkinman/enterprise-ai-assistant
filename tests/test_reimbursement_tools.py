@@ -100,6 +100,23 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(paid.success)
         self.assertEqual(paid.data["state"], "paid")
 
+    async def test_same_submission_key_replays_original_result_after_payment(self):
+        case = await self.ready_case()
+        params = {"case_id": case.case_id, "idempotency_key": "paid-key"}
+        confirmed = {**CONTEXT, "confirmed": True}
+        first = await self.call("submit_claim", params, confirmed)
+        self.assertTrue(first.success)
+        finance = {"user_id": "finance-001", "conv_id": "conv-1"}
+        self.assertTrue((await self.call("review_claim", {"case_id": case.case_id, "approved": True}, finance)).success)
+        self.assertTrue((await self.call("simulate_payment", {"case_id": case.case_id}, finance)).success)
+        before = await self.repo.remaining_budget("engineering")
+        replay = await self.call("submit_claim", params, confirmed)
+        self.assertTrue(replay.success, replay.error)
+        self.assertEqual(replay.data, first.data)
+        self.assertEqual(replay.data["claim_no"], (await self.repo.get_case(case.case_id)).claim_no)
+        self.assertEqual(await self.repo.remaining_budget("engineering"), before)
+        self.assertEqual(before, 2200.0)
+
     async def test_concurrent_distinct_keys_submit_only_once(self):
         case = await self.ready_case()
         async def submit(key):
