@@ -141,6 +141,91 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.repo.remaining_budget("engineering"), 2200.0)
         self.assertNotEqual(first.data["claim_no"], second.data["claim_no"])
 
+    async def test_reusing_original_key_after_rejection_reserves_again(self):
+        case = await self.ready_case()
+        params = {"case_id": case.case_id, "idempotency_key": "same"}
+        submit_context = {**CONTEXT, "confirmed": True}
+        first = await self.call("submit_claim", params, submit_context)
+        self.assertTrue(first.success)
+        rejected = await self.call("review_claim", {"case_id": case.case_id, "approved": False},
+                                   {"user_id": "manager-001", "conv_id": "conv-1"})
+        self.assertTrue(rejected.success)
+        validated = await self.call("validate_claim", {"case_id": case.case_id})
+        self.assertTrue(validated.data["valid"])
+        second = await self.call("submit_claim", params, submit_context)
+        self.assertTrue(second.success)
+        self.assertNotEqual(first.data["claim_no"], second.data["claim_no"])
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 2200.0)
+        current = await self.repo.get_case(case.case_id)
+        self.assertTrue(current.budget_reserved)
+        self.assertEqual(current.state, ClaimState.SUBMITTED)
+
+    async def test_concurrent_approval_and_rejection_cannot_restore_stale_approved_case(self):
+        case = await self.ready_case()
+        submitted = await self.call("submit_claim", {"case_id": case.case_id, "idempotency_key": "first"},
+                                    {**CONTEXT, "confirmed": True})
+        self.assertTrue(submitted.success)
+        original_save = self.repo.save_case
+        approval_at_save = asyncio.Event()
+        release_approval = asyncio.Event()
+
+        async def delayed_save(snapshot):
+            if snapshot.validation.get("review_approved"):
+                approval_at_save.set()
+                await release_approval.wait()
+            return await original_save(snapshot)
+
+        self.repo.save_case = delayed_save
+        reviewer = {"user_id": "manager-001", "conv_id": "conv-1"}
+        approval = asyncio.create_task(self.call("review_claim", {"case_id": case.case_id, "approved": True}, reviewer))
+        try:
+            try:
+                await asyncio.wait_for(approval_at_save.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass  # A locked transition never calls save_case with an approval snapshot.
+            rejected = await self.call("review_claim", {"case_id": case.case_id, "approved": False}, reviewer)
+        finally:
+            release_approval.set()
+        await approval
+        self.assertTrue(rejected.success)
+        current = await self.repo.get_case(case.case_id)
+        self.assertEqual(current.state, ClaimState.REWORK_REQUIRED)
+        self.assertFalse(current.budget_reserved)
+        self.assertFalse(current.validation.get("review_approved", False))
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 3000.0)
+
+    async def test_concurrent_payment_and_rejection_cannot_mark_refunded_case_paid(self):
+        case = await self.ready_case()
+        await self.call("submit_claim", {"case_id": case.case_id, "idempotency_key": "first"},
+                        {**CONTEXT, "confirmed": True})
+        finance = {"user_id": "finance-001", "conv_id": "conv-1"}
+        self.assertTrue((await self.call("review_claim", {"case_id": case.case_id, "approved": True}, finance)).success)
+        original_save = self.repo.save_case
+        payment_at_save = asyncio.Event()
+        release_payment = asyncio.Event()
+
+        async def delayed_save(snapshot):
+            if snapshot.state == ClaimState.PAID:
+                payment_at_save.set()
+                await release_payment.wait()
+            return await original_save(snapshot)
+
+        self.repo.save_case = delayed_save
+        payment = asyncio.create_task(self.call("simulate_payment", {"case_id": case.case_id}, finance))
+        try:
+            try:
+                await asyncio.wait_for(payment_at_save.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass  # A locked payment transition does not call save_case.
+            await self.call("review_claim", {"case_id": case.case_id, "approved": False}, finance)
+        finally:
+            release_payment.set()
+        await payment
+        current = await self.repo.get_case(case.case_id)
+        remaining = await self.repo.remaining_budget("engineering")
+        self.assertFalse(current.state == ClaimState.PAID and remaining == 3000.0)
+        self.assertEqual(current.budget_reserved, remaining == 2200.0)
+
     async def test_nonfinite_expenses_cannot_change_budget(self):
         for amount in (float("nan"), float("inf"), float("-inf")):
             with self.subTest(amount=amount):

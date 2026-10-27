@@ -110,7 +110,8 @@ class InMemoryReimbursementRepository:
             if case is None or case.user_id != user_id or case.conv_id != conv_id:
                 raise ValueError("报销单不存在或无权访问")
             prior = self._idempotency_results.get(key)
-            if prior is not None:
+            if (prior is not None and case.state == ClaimState.SUBMITTED
+                    and case.budget_reserved and prior.get("claim_no") == case.claim_no):
                 return deepcopy(prior)
             if case.state != ClaimState.AWAITING_CONFIRMATION:
                 raise ValueError("报销单尚未等待确认或已经提交")
@@ -138,15 +139,30 @@ class InMemoryReimbursementRepository:
             self._idempotency_results[key] = deepcopy(result)
             return deepcopy(result)
 
-    async def reject_claim(self, case_id: str) -> ReimbursementCase:
-        """Release a submitted claim's exact reservation once under the repository lock."""
+    async def review_claim(self, case_id: str, approved: bool) -> ReimbursementCase:
+        """Approve or reject using the current stored state under one lock."""
         async with self._lock:
             case = self._cases.get(case_id)
             if case is None or case.state != ClaimState.SUBMITTED or not case.budget_reserved:
                 raise ValueError("报销单尚未提交或预算已经释放")
-            amount = self._reserved_amounts.pop(case_id)
-            self._budgets[case.department] += amount
-            case.budget_reserved = False
-            case.state = ClaimState.REWORK_REQUIRED
+            if approved:
+                case.validation["review_approved"] = True
+            else:
+                amount = self._reserved_amounts.pop(case_id)
+                self._budgets[case.department] += amount
+                case.budget_reserved = False
+                case.validation.pop("review_approved", None)
+                case.state = ClaimState.REWORK_REQUIRED
+            case.version += 1
+            return deepcopy(case)
+
+    async def mark_paid(self, case_id: str) -> ReimbursementCase:
+        """Pay only an approved, still-reserved submission under the lock."""
+        async with self._lock:
+            case = self._cases.get(case_id)
+            if (case is None or case.state != ClaimState.SUBMITTED
+                    or not case.budget_reserved or not case.validation.get("review_approved")):
+                raise ValueError("报销单尚未审核通过")
+            case.state = ClaimState.PAID
             case.version += 1
             return deepcopy(case)

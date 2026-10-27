@@ -116,25 +116,14 @@ def build_tools(repository: InMemoryReimbursementRepository) -> list[Tool]:
         role = EMPLOYEES.get(context.get("user_id"), {}).get("role")
         if role not in {"manager", "finance"}:
             raise ValueError("只有经理或财务可以审核")
-        case = await repository.get_case(params["case_id"])
-        if case is None or case.state != ClaimState.SUBMITTED:
-            raise ValueError("报销单尚未提交")
-        if params["approved"]:
-            case.validation["review_approved"] = True
-            await repository.save_case(case)
-        else:
-            case = await repository.reject_claim(case.case_id)
+        case = await repository.review_claim(params["case_id"], params["approved"])
         return {"case_id": case.case_id, "approved": params["approved"], "state": case.state.value}
 
     async def simulate_payment(params, context):
         context = context or {}
         if EMPLOYEES.get(context.get("user_id"), {}).get("role") != "finance":
             raise ValueError("只有财务可以模拟付款")
-        case = await repository.get_case(params["case_id"])
-        if case is None or case.state != ClaimState.SUBMITTED or not case.validation.get("review_approved"):
-            raise ValueError("报销单尚未审核通过")
-        case.state = ClaimState.PAID
-        saved = await repository.save_case(case)
+        saved = await repository.mark_paid(params["case_id"])
         return {"case_id": saved.case_id, "state": saved.state.value, "claim_no": saved.claim_no}
 
     handlers = {

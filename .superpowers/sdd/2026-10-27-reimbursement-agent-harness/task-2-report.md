@@ -46,3 +46,17 @@ Fixes:
 GREEN evidence: `.venv\Scripts\python.exe -m unittest tests.test_reimbursement_tools tests.test_agent_tools tests.test_reimbursement_models_repository -v` exited 0: 30 tests run, 1 skipped (`API dependencies not installed`). `git diff --check` exited 0. The focused test command ran elevated because the initial sandboxed asyncio unittest had hung earlier in this task. No dependencies were installed.
 
 Self-review: cache-key changes affect only calls with context; a rejected reservation cannot be released twice because the method requires `SUBMITTED` plus `budget_reserved`, and records the original amount rather than recomputing it from editable claim data. Submission amount is checked before budget mutation. The cache-leak concern in the original report is resolved by this follow-up. The optional API serialization test remains skipped in this environment.
+
+## Review fixes, round 2
+
+RED evidence: `.venv\Scripts\python.exe -m unittest tests.test_reimbursement_tools.ReimbursementToolsTests.test_reusing_original_key_after_rejection_reserves_again tests.test_reimbursement_tools.ReimbursementToolsTests.test_concurrent_approval_and_rejection_cannot_restore_stale_approved_case -v` exited 1 with two failures. Reusing the first key after a refund returned the old claim number. A deliberately delayed approval save overwrote the rejection and left the case `SUBMITTED` after its budget had been refunded.
+
+Fixes:
+
+- The repository now returns a persisted idempotent result only while its claim number matches a currently `SUBMITTED`, budget-reserved case. A rejected claim can be revalidated and submitted with the same key; the successful result replaces the stale one and reserves the budget once.
+- `review_claim()` and `mark_paid()` are repository methods that inspect and transition the current stored case under one lock. Approval requires a submitted, reserved case; rejection releases that exact reservation; payment requires a submitted, reserved, approved case. Tool handlers delegate to these methods without read-then-save transitions.
+- Tests cover same-key resubmission after rejection, a delayed stale approval save racing with rejection, and payment racing with rejection. The assertions check that refunded cases are never left approved/submitted or paid.
+
+GREEN evidence: `.venv\Scripts\python.exe -m unittest tests.test_reimbursement_tools tests.test_agent_tools tests.test_reimbursement_models_repository -v` exited 0: 33 tests run, 1 skipped (`API dependencies not installed`). `git diff --check` exited 0. The focused test run used the previously established elevated exception because sandboxed asyncio unittest had hung. No dependencies were installed.
+
+Self-review: the repository lock now covers the state read, reservation check, approval/rejection/payment mutation and version increment. The stale idempotency entry is superseded only after a new successful submission. The only remaining test limitation is the optional API serialization skip due to missing dependencies in this virtual environment.
