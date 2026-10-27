@@ -1,7 +1,7 @@
 """按约定自动发现并注册 Agent 工具。"""
 import importlib
 import pkgutil
-from typing import List
+from typing import Any, List
 
 from mcp.tool_manager import MCPToolManager, Tool
 
@@ -9,6 +9,7 @@ from mcp.tool_manager import MCPToolManager, Tool
 def discover_agent_tools(
     manager: MCPToolManager,
     package_name: str = "tools",
+    dependencies: dict[str, Any] | None = None,
 ) -> List[str]:
     """
     加载 package_name 下所有 ``*_tool.py`` 模块。
@@ -29,13 +30,16 @@ def discover_agent_tools(
     )
 
     for module_name in module_names:
+        if module_name == "reimbursement_tool" and not (dependencies or {}).get("reimbursement_repository"):
+            continue
         full_name = f"{package_name}.{module_name}"
         module = importlib.import_module(full_name)
         factory = getattr(module, "build_tools", None)
         if not callable(factory):
             raise RuntimeError(f"工具模块缺少 build_tools(): {full_name}")
 
-        definitions = factory()
+        definitions = (factory(repository=dependencies["reimbursement_repository"])
+                       if module_name == "reimbursement_tool" else factory())
         if isinstance(definitions, Tool):
             definitions = [definitions]
         if not isinstance(definitions, (list, tuple)) or not definitions:

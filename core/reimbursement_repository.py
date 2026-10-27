@@ -2,7 +2,7 @@
 
 import asyncio
 from copy import deepcopy
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from core.reimbursement_models import ClaimState, ReimbursementCase
@@ -92,3 +92,41 @@ class InMemoryReimbursementRepository:
     ) -> None:
         async with self._lock:
             self._idempotency_results[key] = deepcopy(result)
+
+    async def submit_claim(
+        self,
+        case_id: str,
+        idempotency_key: str,
+        user_id: str,
+        conv_id: str,
+        validator: Callable[[ReimbursementCase], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Validate and submit under one lock so budget and idempotency cannot race."""
+        async with self._lock:
+            key = f"{case_id}:submit:{idempotency_key}"
+            case = self._cases.get(case_id)
+            if case is None or case.user_id != user_id or case.conv_id != conv_id:
+                raise ValueError("报销单不存在或无权访问")
+            prior = self._idempotency_results.get(key)
+            if prior is not None:
+                return deepcopy(prior)
+            if case.state != ClaimState.AWAITING_CONFIRMATION:
+                raise ValueError("报销单尚未等待确认或已经提交")
+            validation = validator(case)
+            if not validation["valid"]:
+                raise ValueError("报销单校验未通过")
+            amount = float(validation["required_budget"])
+            available = float(self._budgets.get(case.department, 0.0))
+            if available < amount:
+                raise ValueError("部门预算不足")
+            self._budgets[case.department] = available - amount
+            case.claim_no = f"CLM-{uuid4().hex[:12].upper()}"
+            case.budget_reserved = True
+            case.validation = deepcopy(validation)
+            case.state = ClaimState.SUBMITTED
+            case.version += 1
+            result = {"case_id": case.case_id, "claim_no": case.claim_no,
+                      "state": case.state.value, "total_amount": amount,
+                      "budget_reserved": True}
+            self._idempotency_results[key] = deepcopy(result)
+            return deepcopy(result)

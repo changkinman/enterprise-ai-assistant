@@ -141,7 +141,13 @@ async def lifespan(app: FastAPI):
         fallback=knowledge_fallback,
     ))
 
-    agent_tool_names = discover_agent_tools(_tool_manager)
+    from core.reimbursement_repository import InMemoryReimbursementRepository
+
+    reimbursement_repository = InMemoryReimbursementRepository()
+    app.state.reimbursement_repository = reimbursement_repository
+    agent_tool_names = discover_agent_tools(
+        _tool_manager, dependencies={"reimbursement_repository": reimbursement_repository}
+    )
     logger.info(f"Agent 工具已加载: {agent_tool_names}")
 
     # Agent 编排器在工具注册完成后创建，确保所有 Agent 取得完整工具目录。
