@@ -1,6 +1,8 @@
 """Persist operation previews, idempotency responses and audit events."""
 
 import asyncio
+import hashlib
+import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
@@ -31,6 +33,10 @@ class OperationRepository(Protocol):
     async def lock_for_confirmation(
         self, operation_id: str, actor: Actor, connection: Any,
     ) -> StoredOperation | None: ...
+
+    async def lock_idempotency_key(
+        self, actor: Actor, action_type: str, key: str, connection: Any,
+    ) -> None: ...
 
     async def load_idempotency(
         self, actor: Actor, action_type: str, key: str, request_hash: str,
@@ -70,7 +76,13 @@ class InMemoryOperationRepository:
     async def transaction(self) -> AsyncIterator[object]:
         try:
             async with self._lock:
-                yield self._transaction_marker
+                snapshot = (deepcopy(self._operations), deepcopy(self._idempotency),
+                            deepcopy(self._audit_events))
+                try:
+                    yield self._transaction_marker
+                except BaseException:
+                    self._operations, self._idempotency, self._audit_events = snapshot
+                    raise
         except OperationExpired as exc:
             await self.expire_pending(exc.operation_id, exc.actor)
             raise
@@ -125,6 +137,13 @@ class InMemoryOperationRepository:
             if operation.state is OperationState.PENDING and operation.expires_at <= datetime.now(timezone.utc):
                 raise OperationExpired(operation_id, actor)
             return deepcopy(operation)
+
+    async def lock_idempotency_key(
+        self, actor: Actor, action_type: str, key: str, connection: Any,
+    ) -> None:
+        if connection is not self._transaction_marker:
+            raise ValueError("Idempotency lock requires an active transaction")
+        # The transaction's global lock already serializes all in-memory confirmations.
 
     async def load_idempotency(
         self, actor: Actor, action_type: str, key: str, request_hash: str,
@@ -279,6 +298,17 @@ class PostgresOperationRepository:
             if clock_row["is_expired"]:
                 raise OperationExpired(operation_id, actor)
         return operation
+
+    async def lock_idempotency_key(
+        self, actor: Actor, action_type: str, key: str, connection: Any,
+    ) -> None:
+        if connection is None:
+            raise ValueError("Idempotency lock requires an active transaction connection")
+        identity = json.dumps([actor.id, action_type, key], ensure_ascii=False,
+                              separators=(",", ":"))
+        lock_id = int.from_bytes(hashlib.sha256(identity.encode("utf-8")).digest()[:8],
+                                 "big", signed=True)
+        await connection.execute("SELECT pg_advisory_xact_lock($1::bigint)", lock_id)
 
     async def load_idempotency(
         self, actor: Actor, action_type: str, key: str, request_hash: str,

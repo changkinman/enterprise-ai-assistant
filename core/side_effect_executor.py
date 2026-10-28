@@ -85,6 +85,9 @@ class SideEffectExecutor:
 
                 request_hash = _digest({"operation_id": operation.operation_id,
                                         "snapshot_hash": operation.snapshot_hash})
+                await self.repository.lock_idempotency_key(
+                    actor, operation.action_type, idempotency_key, connection,
+                )
                 replay = await self.repository.load_idempotency(
                     actor, operation.action_type, idempotency_key, request_hash, connection,
                 )
@@ -106,16 +109,20 @@ class SideEffectExecutor:
                         or current_hash != operation.snapshot_hash):
                     raise OperationVersionConflict("Operation preview is stale")
 
+                # This DB-clock-checked transition authorizes the effect while the row
+                # lock is held. Expiry during a slow adapter call cannot revoke it.
+                await self.repository.save_completed(operation_id, actor, connection)
                 commit_started = True
                 response = await adapter.commit(actor, operation.params, idempotency_key)
                 await self.repository.save_idempotency(
                     actor, operation.action_type, idempotency_key, request_hash, response, connection,
                 )
-                await self.repository.save_completed(operation_id, actor, connection)
                 await self.repository.append_audit(operation_id, "commit_succeeded", actor, {}, connection)
                 return response
         except OperationExpired:
             # Repositories persist the expiry transition after the failed transaction.
+            await self.repository.append_audit(operation_id, "confirmation_rejected", actor,
+                                               {"reason": "OperationExpired"})
             raise
         except (IdempotencyConflict, OperationNotFound, OperationStateConflict,
                 OperationVersionConflict, ValidationRejected) as exc:

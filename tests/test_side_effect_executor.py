@@ -4,7 +4,7 @@ import asyncio
 from copy import deepcopy
 import os
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from unittest.mock import patch
@@ -42,6 +42,35 @@ class RecordingOperation:
         self.committed.append(dict(normalized))
         await asyncio.sleep(0)
         return {"receipt": "demo-1", "amount": normalized["amount"]}
+
+
+class IndependentOperationRepository(InMemoryOperationRepository):
+    """Model separate operation row locks plus a transaction-scoped key lock."""
+
+    def __init__(self):
+        super().__init__()
+        self.operation_locks = {}
+        self.key_locks = {}
+
+    @asynccontextmanager
+    async def transaction(self):
+        held = []
+        try:
+            yield held
+        finally:
+            for lock in reversed(held):
+                lock.release()
+
+    async def lock_for_confirmation(self, operation_id, actor, connection):
+        lock = self.operation_locks.setdefault(operation_id, asyncio.Lock())
+        await lock.acquire()
+        connection.append(lock)
+        return await super().lock_for_confirmation(operation_id, actor)
+
+    async def lock_idempotency_key(self, actor, action_type, key, connection):
+        lock = self.key_locks.setdefault((actor.id, action_type, key), asyncio.Lock())
+        await lock.acquire()
+        connection.append(lock)
 
 
 class SideEffectExecutorTests(unittest.IsolatedAsyncioTestCase):
@@ -107,6 +136,27 @@ class SideEffectExecutorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(OperationExpired):
             await self.executor.confirm(self.actor, preview.operation_id, "k1")
         self.assertEqual(self.adapter.commit_calls, 0)
+        self.assertEqual([event["event_type"] for event in self.repo.audit_events][-2:],
+                         ["preview_expired", "confirmation_rejected"])
+
+    async def test_commit_can_finish_after_preview_deadline_once_authorized(self):
+        preview = await self.prepare()
+        original_commit = self.adapter.commit
+
+        async def slow_commit(actor, params, key):
+            result = await original_commit(actor, params, key)
+            stored = self.repo._operations[preview.operation_id]
+            self.repo._operations[preview.operation_id] = replace(
+                stored, expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+            )
+            return result
+
+        self.adapter.commit = slow_commit
+        result = await self.executor.confirm(self.actor, preview.operation_id, "k1")
+        self.assertEqual(result, {"receipt": "demo-1", "amount": 100})
+        self.assertEqual(self.adapter.commit_calls, 1)
+        self.assertEqual((await self.repo.get_for_actor(preview.operation_id, self.actor)).state,
+                         OperationState.COMPLETED)
 
     async def test_preview_expired_601_seconds_ago_cannot_commit(self):
         expired_executor = SideEffectExecutor(
@@ -153,6 +203,27 @@ class SideEffectExecutorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.adapter.commit_calls, 1)
         self.assertEqual(sum(isinstance(item, dict) for item in results), 1)
+
+    async def test_same_key_on_distinct_operations_serializes_before_business_commit(self):
+        repository = IndependentOperationRepository()
+        executor = SideEffectExecutor(repository, {"demo_write": self.adapter})
+        first = await executor.prepare(self.actor, ActionProposal("demo_write", {"amount": 100}))
+        second = await executor.prepare(self.actor, ActionProposal("demo_write", {"amount": 100}))
+        original_commit = self.adapter.commit
+
+        async def delayed_commit(actor, params, key):
+            await asyncio.sleep(0.02)
+            return await original_commit(actor, params, key)
+
+        self.adapter.commit = delayed_commit
+        results = await asyncio.gather(
+            executor.confirm(self.actor, first.operation_id, "shared-key"),
+            executor.confirm(self.actor, second.operation_id, "shared-key"),
+            return_exceptions=True,
+        )
+        self.assertEqual(self.adapter.commit_calls, 1)
+        self.assertEqual(sum(isinstance(result, dict) for result in results), 1)
+        self.assertEqual(sum(isinstance(result, IdempotencyConflict) for result in results), 1)
 
     async def test_empty_idempotency_key_is_rejected(self):
         preview = await self.prepare()
@@ -368,6 +439,17 @@ class TransactionalDatabase:
 
 
 class PostgresOperationRepositoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_idempotency_lock_uses_stable_transaction_scoped_advisory_key(self):
+        connection = FakeConnection()
+        repository = PostgresOperationRepository(FakeDatabase(connection))
+        actor = Actor("emp-001", "employee")
+        await repository.lock_idempotency_key(actor, "demo_write", "shared-key", connection)
+        await repository.lock_idempotency_key(actor, "demo_write", "shared-key", connection)
+        await repository.lock_idempotency_key(actor, "demo_write", "other-key", connection)
+        self.assertTrue(all("pg_advisory_xact_lock" in sql for sql, _ in connection.statements))
+        self.assertEqual(connection.statements[0][1], connection.statements[1][1])
+        self.assertNotEqual(connection.statements[0][1], connection.statements[2][1])
+
     async def test_confirmation_locks_only_actor_owned_row_in_given_transaction(self):
         future = datetime.now(timezone.utc) + timedelta(minutes=10)
         row = {
