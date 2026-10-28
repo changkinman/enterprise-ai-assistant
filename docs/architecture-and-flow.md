@@ -41,10 +41,10 @@ FastAPI（api/main.py）
   Anthropic 兼容 LLM API    Prometheus
           │
           ├── Redis（会话工作记忆）
-          └── ChromaDB（情景记忆、画像、知识库）
+          └── PostgreSQL + pgvector（情景记忆、画像、知识库）
 ```
 
-`api/main.py` 是应用装配点。FastAPI 生命周期启动时创建并连接编排器、意图识别器、记忆管理器、工具管理器、知识库、评测器和监控器；HTTP 路由复用这些已初始化的组件处理请求。
+`api/main.py` 是应用装配点。FastAPI 生命周期启动时连接一次 PostgreSQL，构造显式 Embedding provider 与共享 VectorStore，并注入记忆管理器和知识库；HTTP 路由复用这些已初始化的组件处理请求。关闭时释放数据库连接池。
 
 模型调用使用 `anthropic.AsyncAnthropic` 的异步客户端。通过设置 `ANTHROPIC_BASE_URL` 可将请求指向 Anthropic 兼容的第三方接口（例如 DeepSeek 的 Anthropic 兼容端点）；因此 SDK 名称并不等同于实际使用 Claude 模型。
 
@@ -55,9 +55,9 @@ FastAPI（api/main.py）
 | API 层 | `api/main.py` | 生命周期管理、请求校验、HTTP 响应序列化 | FastAPI、全部核心组件 |
 | Agent 编排 | `agents/agent_orchestrator.py` | 按意图选择领域 Agent；复合问题并行派发；按成功率、延迟和监控惩罚选择实例 | IntentRecognizer、工具管理器、监控器 |
 | 意图识别 | `core/intent_recognizer.py` | LLM Few-shot、Embedding 相似度、关键词规则的综合识别；实体和紧急度提取；缓存 | LLM、可选 Embedding |
-| 记忆 | `memory/conversation_memory.py` | 管理短期会话、跨会话历史与长期画像；长对话摘要压缩 | Redis、ChromaDB、LLM |
+| 记忆 | `memory/conversation_memory.py` | 管理短期会话、跨会话历史与长期画像；长对话摘要压缩 | Redis、VectorStore、LLM |
 | 工具治理 | `mcp/tool_manager.py` | 工具注册和 Agent 授权；参数校验、缓存、超时、熔断、降级；检索查询改写和重排 | LLM、KnowledgeBase |
-| 知识库 | `mcp/knowledge_base.py` | 文档切片、向量写入、检索 | ChromaDB |
+| 知识库 | `mcp/knowledge_base.py` | 文档切片、向量写入、检索 | VectorStore、显式 Embedding provider |
 | 评测 | `evaluation/evaluator.py` | 意图 Accuracy/F1、LLM-as-Judge、端到端多轮和基线回归评测 | 编排器、识别器、LLM |
 | 监控 | `monitor/performance_monitor.py` | Prometheus 指标、Z-score 异常检测、告警和路由惩罚反馈 | 编排器、Prometheus |
 
@@ -68,8 +68,9 @@ FastAPI（api/main.py）
   → 加载 .env 与日志配置
   → FastAPI lifespan 开始
   → 读取 LLM 配置（API Key、模型、可选 Base URL）
-  → 创建 Redis / ChromaDB 相关管理组件
-  → 创建知识库与工具管理器，并注册受治理工具
+  → 连接 PostgreSQL，构造 pgvector VectorStore 和显式 Embedding provider
+  → 创建 Redis 工作记忆管理组件、知识库和工具管理器
+  → 空知识库时播种默认文档，并注册受治理工具
   → 创建意图识别器、领域 Agent 编排器、评测器与监控器
   → 对外提供 HTTP 接口
   → 应用关闭时释放/关闭相关资源
@@ -83,7 +84,7 @@ FastAPI（api/main.py）
 用户消息、会话 ID、用户 ID
   │
   ├─ 1. 读取记忆
-  │     Redis 近期消息 + ChromaDB 相关历史 + 用户画像
+  │     Redis 近期消息 + PostgreSQL/pgvector 相关历史 + 用户画像
   │
   ├─ 2. 识别请求
   │     LLM / Embedding / 规则 → 意图、实体、紧急度、置信度
@@ -118,8 +119,8 @@ LLM 与 Embedding 分支可并行运行。为兼容第三方 Anthropic API，当
 | 层级 | 存储 | 作用 |
 | --- | --- | --- |
 | 工作记忆 | Redis | 保存当前会话的近期消息，默认 TTL 为 24 小时 |
-| 情景记忆 | ChromaDB | 保存可跨会话检索的企业服务历史片段 |
-| 用户画像 | ChromaDB | 保存从对话中提炼的长期偏好、部门和常用业务实体 |
+| 情景记忆 | PostgreSQL + pgvector | 保存可跨会话检索的企业服务历史片段 |
+| 用户画像 | PostgreSQL | 保存从对话中提炼的长期偏好、部门和常用业务实体 |
 
 当会话历史达到阈值时，系统会使用 LLM 将较早消息压缩为摘要。执行 Agent 前，记忆管理器将摘要、相似历史、用户画像与最近消息组合为上下文；完成响应后，再将本轮内容和可沉淀信息写回相应层级。
 
@@ -131,7 +132,7 @@ LLM 与 Embedding 分支可并行运行。为兼容第三方 Anthropic API，当
 制度/流程/操作规范文档
   → /knowledge 或 /knowledge/upload
   → 文本抽取与切片
-  → 生成向量并写入 ChromaDB
+  → 显式 Embedding provider 生成向量并写入 PostgreSQL + pgvector
   → 保留可检索的内容及元数据
 ```
 
@@ -189,8 +190,8 @@ Agent 请求工具
 
 ## 9. 部署与维护要点
 
-- 推荐通过 Docker Compose 同时启动 EchoMind、Redis、ChromaDB、Prometheus 和 Nginx。
+- 推荐通过 Docker Compose 同时启动 EchoMind、Redis、PostgreSQL + pgvector、Prometheus 和 Nginx。
 - 请求路径应保持异步：API、模型调用、工具调用与记忆操作均优先使用 `async` / `await`，避免阻塞 FastAPI 事件循环。
 - 变更 Agent、工具或评测数据结构时，同时检查 API 响应序列化、监控统计以及测试覆盖。
 - 核心行为的测试重点包括工具错误、超时和熔断、路由降级及数据序列化。当前测试位于 `tests/test_agent_tools.py`。
-- 本项目当前可准确描述为：多 Agent、RAG、LLM Tool Calling、Redis + ChromaDB 三级记忆、LLM-as-Judge、Prometheus 监控和 Docker Compose 部署。不要将其表述为已实现标准 MCP 协议、真实动态学习的意图权重、Grafana 可视化或外部业务系统集成，除非对应能力后续实际完成并验证。
+- 本项目当前可准确描述为：多 Agent、RAG、LLM Tool Calling、Redis + PostgreSQL/pgvector 三级记忆、LLM-as-Judge、Prometheus 监控和 Docker Compose 部署。不要将其表述为已实现标准 MCP 协议、真实动态学习的意图权重、Grafana 可视化或外部业务系统集成，除非对应能力后续实际完成并验证。

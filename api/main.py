@@ -73,7 +73,10 @@ async def lifespan(app: FastAPI):
     print(BANNER, flush=True)
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
+    from core.database import Database
+    from core.embeddings import SentenceTransformerEmbeddingProvider
     from core.intent_recognizer import IntentRecognizer
+    from core.vector_store import VectorStore
     from evaluation.evaluator import EndToEndEvaluator
     from mcp.knowledge_base import KnowledgeBase
     from mcp.tool_manager import MCPToolManager, Tool
@@ -83,6 +86,9 @@ async def lifespan(app: FastAPI):
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
+    database = Database()
+    await database.connect()
+    vector_store = VectorStore(database, SentenceTransformerEmbeddingProvider(database.settings))
 
     # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
     recognizer = IntentRecognizer(
@@ -91,29 +97,24 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
 
-    # 记忆管理器（Redis 工作记忆 + ChromaDB 情景记忆/用户画像）
+    # 记忆管理器（Redis 工作记忆 + PostgreSQL 情景记忆/用户画像）
     _memory = MemoryManager(
         redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
-        chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
+        vector_store=vector_store,
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
     )
 
-    # MCP 工具管理器 + RAG 知识库（基于 ChromaDB 的真实检索）
+    # MCP 工具管理器 + RAG 知识库
     _tool_manager = MCPToolManager(
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
     )
-    kb = KnowledgeBase(
-        chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
-    )
-    logger.info(f"知识库已加载: {kb.doc_count} 个文档片段")
+    kb = KnowledgeBase(vector_store)
+    await kb.ensure_default_documents()
+    logger.info("知识库已加载: %s 个文档片段", await kb.doc_count())
 
     def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
         query = params.get("query", "")
@@ -127,7 +128,7 @@ async def lifespan(app: FastAPI):
 
     _tool_manager.register(Tool(
         name="knowledge_search",
-        description="搜索知识库（基于 ChromaDB 向量检索）",
+        description="搜索知识库（基于 pgvector 向量检索）",
         handler=kb.search_handler,
         schema={
             "type": "object",
@@ -183,10 +184,14 @@ async def lifespan(app: FastAPI):
     )
 
     logger.info("EchoMind 已就绪")
-    yield
-
-    await _monitor.stop()
-    logger.info("EchoMind 已关闭")
+    try:
+        yield
+    finally:
+        try:
+            await _monitor.stop()
+        finally:
+            await database.close()
+            logger.info("EchoMind 已关闭")
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -490,7 +495,7 @@ async def add_knowledge(body: BatchDocInput):
     """
     批量导入文档到知识库。
 
-    文档会自动切片（每片 500 字）并存入 ChromaDB，ChromaDB 内置 Embedding 模型自动向量化。
+    文档会自动切片（每片 500 字），由显式 Embedding 模型向量化并存入 PostgreSQL。
 
     示例请求体：
     ```json
@@ -506,8 +511,8 @@ async def add_knowledge(body: BatchDocInput):
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    count = kb.add_documents([{"title": d.title, "content": d.content} for d in body.documents])
-    return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": kb.doc_count}
+    count = await kb.add_documents([{"title": d.title, "content": d.content} for d in body.documents])
+    return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": await kb.doc_count()}
 
 
 @app.post("/knowledge/upload", tags=["知识库"])
@@ -546,11 +551,11 @@ async def upload_knowledge(file: UploadFile = File(...)):
         title = filename.rsplit(".", 1)[0] if "." in filename else filename
         docs = [{"title": title, "content": text}]
 
-    count = kb.add_documents(docs)
+    count = await kb.add_documents(docs)
     return {
         "message": f"文件 {filename} 导入成功",
         "added_chunks": count,
-        "total_chunks": kb.doc_count,
+        "total_chunks": await kb.doc_count(),
     }
 
 
@@ -561,7 +566,7 @@ async def knowledge_stats():
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    return {"total_chunks": kb.doc_count}
+    return {"total_chunks": await kb.doc_count()}
 
 
 @app.post("/eval/run")
@@ -621,11 +626,17 @@ async def _cli():
     print("EchoMind CLI — 输入 quit 退出\n")
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
+    from core.database import Database
+    from core.embeddings import SentenceTransformerEmbeddingProvider
+    from core.vector_store import VectorStore
     from memory.conversation_memory import MemoryManager, MsgRole
     from mcp.tool_manager import MCPToolManager
     from tools.loader import discover_agent_tools
 
     cfg = _anthropic_cfg()
+    database = Database()
+    await database.connect()
+    vector_store = VectorStore(database, SentenceTransformerEmbeddingProvider(database.settings))
     tool_manager = MCPToolManager(
         api_key=cfg["api_key"], base_url=cfg.get("base_url"), model=cfg["model"]
     )
@@ -639,9 +650,7 @@ async def _cli():
     )
     mem  = MemoryManager(
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
-        chroma_host=os.getenv("CHROMA_HOST", "localhost"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/tmp/chroma"),
+        vector_store=vector_store,
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
@@ -671,6 +680,8 @@ async def _cli():
         await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
         print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
+
+    await database.close()
 
 
 if __name__ == "__main__":

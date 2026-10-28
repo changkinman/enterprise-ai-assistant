@@ -38,6 +38,10 @@ class VectorStore:
                 )
         return len(chunks)
 
+    async def count_knowledge(self) -> int:
+        async with self.database.transaction() as conn:
+            return await conn.fetchval("SELECT COUNT(*) FROM knowledge_chunks")
+
     async def search_knowledge(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
         if not query.strip() or top_k <= 0:
             return []

@@ -8,6 +8,7 @@ from unittest.mock import patch
 from core.database import DatabaseSettings
 from core.embeddings import SentenceTransformerEmbeddingProvider
 from core.vector_store import VectorStore
+from mcp.knowledge_base import KnowledgeBase
 
 
 class FakeEmbeddingProvider:
@@ -42,6 +43,10 @@ class FakeConnection:
         profile = self.profiles.get(args[0])
         return None if profile is None else {"profile": profile}
 
+    async def fetchval(self, sql, *args):
+        self.fetches.append((" ".join(sql.split()), args))
+        return self.count
+
 
 class FakeDatabase:
     def __init__(self, connection):
@@ -72,6 +77,13 @@ class VectorStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("LIMIT $2", sql)
         self.assertNotIn("住宿'", sql)
         self.assertEqual(args, ([3.0, 0.0, 1.0], 3))
+
+    async def test_knowledge_count_reads_database(self):
+        self.conn.count = 7
+        self.assertEqual(await self.store.count_knowledge(), 7)
+        sql, args = self.conn.fetches[-1]
+        self.assertIn("COUNT(*)", sql)
+        self.assertEqual(args, ())
 
     async def test_episodic_search_scopes_owner_and_returns_summaries(self):
         self.conn.rows = [{"summary": "旧报销记录", "distance": 0.1}]
@@ -191,3 +203,43 @@ class EmbeddingProviderTests(unittest.IsolatedAsyncioTestCase):
                 SentenceTransformer=FakeModel)}):
             with self.assertRaises(ValueError):
                 await SentenceTransformerEmbeddingProvider().embed(["甲"])
+
+
+class FakeKnowledgeStore:
+    def __init__(self, count=0):
+        self.count = count
+        self.saved = []
+
+    async def count_knowledge(self):
+        return self.count
+
+    async def add_knowledge(self, chunks):
+        self.saved.extend(chunks)
+        self.count += len(chunks)
+        return len(chunks)
+
+    async def search_knowledge(self, query, top_k):
+        return [{"title": "差旅制度", "content": "住宿上限 500 元", "score": 0.8765, "chunk": 2}]
+
+
+class KnowledgeBaseCompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_search_handler_preserves_chunk_result_shape(self):
+        store = FakeKnowledgeStore()
+        kb = KnowledgeBase(store)
+        self.assertEqual(await kb.search_handler({"query": "住宿", "top_k": 3}, None), [{
+            "title": "差旅制度", "content": "住宿上限 500 元", "score": 0.8765, "chunk": 2,
+        }])
+
+    async def test_default_documents_seed_once_when_storage_is_empty(self):
+        store = FakeKnowledgeStore()
+        kb = KnowledgeBase(store)
+        self.assertEqual(store.saved, [])
+        await kb.ensure_default_documents()
+        first_count = store.count
+        self.assertGreater(first_count, 0)
+        await kb.ensure_default_documents()
+        self.assertEqual(store.count, first_count)
+
+        populated = FakeKnowledgeStore(count=2)
+        await KnowledgeBase(populated).ensure_default_documents()
+        self.assertEqual(populated.saved, [])
