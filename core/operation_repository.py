@@ -234,8 +234,9 @@ class PostgresOperationRepository:
     async def _expire_if_needed(self, operation: StoredOperation, connection: Any) -> StoredOperation:
         if operation.state is OperationState.PENDING:
             status = await connection.execute(
-                """UPDATE operations SET state='expired', updated_at=now()
-                   WHERE operation_id=$1 AND state='pending' AND expires_at <= now()""",
+                """UPDATE operations SET state='expired', updated_at=clock_timestamp()
+                   WHERE operation_id=$1 AND state='pending'
+                     AND expires_at <= clock_timestamp()""",
                 operation.operation_id,
             )
             if status == "UPDATE 1":
@@ -263,15 +264,20 @@ class PostgresOperationRepository:
         if connection is None:
             raise ValueError("Confirmation lock requires an active transaction connection")
         row = await connection.fetchrow(
-            """SELECT *, (expires_at <= now()) AS is_expired FROM operations
-               WHERE operation_id=$1 AND actor_id=$2 FOR UPDATE""",
+            "SELECT * FROM operations WHERE operation_id=$1 AND actor_id=$2 FOR UPDATE",
             operation_id, actor.id,
         )
         if row is None:
             return None
         operation = self._operation(row)
-        if operation.state is OperationState.PENDING and row["is_expired"]:
-            raise OperationExpired(operation_id, actor)
+        if operation.state is OperationState.PENDING:
+            # Read wall time only after FOR UPDATE has acquired the row lock.
+            clock_row = await connection.fetchrow(
+                "SELECT $1::timestamptz <= clock_timestamp() AS is_expired",
+                operation.expires_at,
+            )
+            if clock_row["is_expired"]:
+                raise OperationExpired(operation_id, actor)
         return operation
 
     async def load_idempotency(
@@ -313,15 +319,15 @@ class PostgresOperationRepository:
     ) -> StoredOperation:
         async with self._connection(connection) as active:
             row = await active.fetchrow(
-                """UPDATE operations SET state='completed', updated_at=now()
+                """UPDATE operations SET state='completed', updated_at=clock_timestamp()
                    WHERE operation_id=$1 AND actor_id=$2 AND state='pending'
-                     AND expires_at > now()
+                     AND expires_at > clock_timestamp()
                    RETURNING *""",
                 operation_id, actor.id,
             )
             if row is None:
                 current = await active.fetchrow(
-                    """SELECT *, (expires_at <= now()) AS is_expired FROM operations
+                    """SELECT *, (expires_at <= clock_timestamp()) AS is_expired FROM operations
                        WHERE operation_id=$1 AND actor_id=$2 FOR UPDATE""",
                     operation_id, actor.id,
                 )

@@ -119,6 +119,8 @@ class FakeConnection:
         self.statements.append((sql, params))
         if self.row is None:
             return None
+        if "FROM operations" not in sql and "AS is_expired" in sql:
+            return {"is_expired": params[0] <= datetime.now(timezone.utc)}
         result = deepcopy(self.row)
         if "AS is_expired" in sql:
             result["is_expired"] = result["expires_at"] <= datetime.now(timezone.utc)
@@ -141,27 +143,37 @@ class FakeDatabase:
 class TransactionalConnection:
     """Only the SQL effects under test; commit or rollback belongs to the fake DB."""
 
-    def __init__(self, row, audit, now):
+    def __init__(self, row, audit, now, after_lock=None):
         self.row = row
         self.audit = audit
         self.now = now
+        self.after_lock = after_lock
+        self.transaction_started_at = now()
         self.statements = []
+
+    def sql_time(self, sql):
+        return self.now() if "clock_timestamp()" in sql else self.transaction_started_at
 
     async def fetchrow(self, sql, *params):
         self.statements.append((sql, params))
+        if "FROM operations" not in sql and "AS is_expired" in sql:
+            return {"is_expired": params[0] <= self.sql_time(sql)}
         if sql.lstrip().startswith("SELECT"):
             if (self.row["operation_id"], self.row["actor_id"]) != params[:2]:
                 return None
             result = deepcopy(self.row)
             if "AS is_expired" in sql:
-                result["is_expired"] = self.row["expires_at"] <= self.now()
+                result["is_expired"] = self.row["expires_at"] <= self.sql_time(sql)
+            if "FOR UPDATE" in sql and self.after_lock is not None:
+                callback, self.after_lock = self.after_lock, None
+                callback()
             return result
         if sql.lstrip().startswith("UPDATE operations SET state='completed'"):
             if (self.row["operation_id"], self.row["actor_id"]) != params[:2]:
                 return None
             if self.row["state"] != "pending":
                 return None
-            if "expires_at > now()" in sql and self.row["expires_at"] <= self.now():
+            if ("expires_at > now()" in sql or "expires_at > clock_timestamp()" in sql) and self.row["expires_at"] <= self.sql_time(sql):
                 return None
             self.row["state"] = "completed"
             return deepcopy(self.row)
@@ -171,7 +183,7 @@ class TransactionalConnection:
         self.statements.append((sql, params))
         if sql.lstrip().startswith("UPDATE operations SET state='expired'"):
             if (self.row["operation_id"] == params[0] and self.row["state"] == "pending"
-                    and self.row["expires_at"] <= self.now()):
+                    and self.row["expires_at"] <= self.sql_time(sql)):
                 self.row["state"] = "expired"
                 return "UPDATE 1"
             return "UPDATE 0"
@@ -187,10 +199,14 @@ class TransactionalDatabase:
         self.audit = []
         self.connections = []
         self.now = datetime.now(timezone.utc)
+        self.after_lock = None
 
     @asynccontextmanager
     async def transaction(self):
-        connection = TransactionalConnection(deepcopy(self.row), deepcopy(self.audit), lambda: self.now)
+        connection = TransactionalConnection(
+            deepcopy(self.row), deepcopy(self.audit), lambda: self.now, self.after_lock,
+        )
+        self.after_lock = None
         self.connections.append(connection)
         yield connection
         self.row, self.audit = connection.row, connection.audit
@@ -251,6 +267,25 @@ class PostgresOperationRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(database.row["state"], "pending")
         self.assertEqual(database.audit, [])
 
+    async def test_lock_wait_past_expiry_uses_live_database_clock(self):
+        database_now = datetime.now(timezone.utc)
+        future = database_now + timedelta(minutes=10)
+        row = {
+            "operation_id": "op-1", "actor_id": "emp-001", "action_type": "access_request",
+            "params": {}, "preview": {"summary": "Apply", "details": {}},
+            "snapshot_hash": "snapshot", "resource_version": 1,
+            "state": "pending", "expires_at": future,
+        }
+        database = TransactionalDatabase(row)
+        database.now = database_now
+        database.after_lock = lambda: setattr(database, "now", future + timedelta(seconds=1))
+        repository = PostgresOperationRepository(database)
+        with self.assertRaises(OperationExpired):
+            async with repository.transaction() as connection:
+                await repository.lock_for_confirmation("op-1", Actor("emp-001", "employee"), connection)
+        self.assertEqual(database.row["state"], "expired")
+        self.assertEqual(database.audit, [{"operation_id": "op-1", "event_type": "preview_expired", "actor_id": "emp-001"}])
+
     async def test_completion_rejects_expiry_that_occurs_after_lock(self):
         future = datetime.now(timezone.utc) + timedelta(minutes=10)
         row = {
@@ -276,7 +311,7 @@ class PostgresOperationRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(database.audit[0]["event_type"], "preview_expired")
         completion_sql = next(sql for connection in database.connections for sql, _ in connection.statements
                               if "UPDATE operations SET state='completed'" in sql)
-        self.assertIn("expires_at > now()", completion_sql)
+        self.assertIn("expires_at > clock_timestamp()", completion_sql)
 
 
 if __name__ == "__main__":
