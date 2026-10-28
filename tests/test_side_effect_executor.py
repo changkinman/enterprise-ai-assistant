@@ -15,8 +15,163 @@ from fastapi import HTTPException
 from core.auth import Actor, AuthenticationError, create_access_token, create_dev_access_token, decode_actor, get_current_actor
 from core.operation_repository import InMemoryOperationRepository, PostgresOperationRepository
 from core.operations import IdempotencyConflict, OperationExpired, OperationState, PreviewPayload
+from core.operations import (
+    ActionProposal, OperationNotFound, OperationStateConflict, OperationVersionConflict,
+    ValidationRejected, ValidationResult,
+)
+from core.side_effect_executor import SideEffectExecutor
 
 TEST_SECRET = "test-secret-key-with-at-least-32-bytes"
+
+
+class RecordingOperation:
+    def __init__(self):
+        self.allowed = True
+        self.version = 3
+        self.commit_calls = 0
+        self.committed = []
+
+    async def precheck(self, actor, params):
+        return ValidationResult(self.allowed, dict(params), self.version, "denied" if not self.allowed else None)
+
+    async def build_preview(self, actor, normalized, validation):
+        return PreviewPayload("Submit demo write", {"amount": normalized["amount"]})
+
+    async def commit(self, actor, normalized, idempotency_key):
+        self.commit_calls += 1
+        self.committed.append(dict(normalized))
+        await asyncio.sleep(0)
+        return {"receipt": "demo-1", "amount": normalized["amount"]}
+
+
+class SideEffectExecutorTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.repo = InMemoryOperationRepository()
+        self.adapter = RecordingOperation()
+        self.actor = Actor("emp-001", "employee")
+        self.executor = SideEffectExecutor(self.repo, {"demo_write": self.adapter})
+
+    async def prepare(self, params=None):
+        return await self.executor.prepare(self.actor, ActionProposal("demo_write", params or {"amount": 100}))
+
+    async def test_prepare_creates_preview_without_commit_and_stable_snapshot(self):
+        first = await self.prepare({"amount": 100, "memo": "trip"})
+        second = await self.prepare({"memo": "trip", "amount": 100})
+        self.assertEqual(first.state, OperationState.PENDING)
+        self.assertEqual(first.preview.details["amount"], 100)
+        self.assertEqual(self.adapter.commit_calls, 0)
+        stored = await self.repo.get_for_actor(first.operation_id, self.actor)
+        reordered = await self.repo.get_for_actor(second.operation_id, self.actor)
+        self.assertEqual(stored.snapshot_hash, reordered.snapshot_hash)
+        self.assertEqual(len(stored.snapshot_hash), 64)
+        self.assertEqual((await self.executor.get_preview(self.actor, first.operation_id)).operation_id, first.operation_id)
+
+    async def test_invalid_or_unknown_proposal_does_not_create_pending_or_commit(self):
+        self.adapter.allowed = False
+        with self.assertRaises(ValidationRejected):
+            await self.prepare()
+        with self.assertRaises(ValidationRejected):
+            await self.executor.prepare(self.actor, ActionProposal("missing", {"amount": 100}))
+        self.assertEqual(self.adapter.commit_calls, 0)
+        self.assertIn("precheck_rejected", [event["event_type"] for event in self.repo.audit_events])
+
+    async def test_matching_key_replays_once_and_different_key_rejects_completed(self):
+        preview = await self.prepare()
+        first = await self.executor.confirm(self.actor, preview.operation_id, "retry-1")
+        self.assertEqual(await self.executor.confirm(self.actor, preview.operation_id, "retry-1"), first)
+        self.assertEqual(self.adapter.commit_calls, 1)
+        with self.assertRaises(OperationStateConflict):
+            await self.executor.confirm(self.actor, preview.operation_id, "retry-2")
+
+    async def test_same_key_on_different_operation_conflicts(self):
+        first, second = await self.prepare(), await self.prepare()
+        await self.executor.confirm(self.actor, first.operation_id, "same-key")
+        with self.assertRaises(IdempotencyConflict):
+            await self.executor.confirm(self.actor, second.operation_id, "same-key")
+        self.assertEqual(self.adapter.commit_calls, 1)
+
+    async def test_other_actor_and_unknown_operation_cannot_confirm(self):
+        preview = await self.prepare()
+        with self.assertRaises(OperationNotFound):
+            await self.executor.confirm(Actor("emp-002", "employee"), preview.operation_id, "k1")
+        with self.assertRaises(OperationNotFound):
+            await self.executor.confirm(self.actor, "missing", "k1")
+        self.assertEqual(self.adapter.commit_calls, 0)
+
+    async def test_expired_preview_cannot_commit(self):
+        preview = await self.prepare()
+        stored = self.repo._operations[preview.operation_id]
+        self.repo._operations[preview.operation_id] = __import__("dataclasses").replace(
+            stored, expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+        with self.assertRaises(OperationExpired):
+            await self.executor.confirm(self.actor, preview.operation_id, "k1")
+        self.assertEqual(self.adapter.commit_calls, 0)
+
+    async def test_preview_expired_601_seconds_ago_cannot_commit(self):
+        expired_executor = SideEffectExecutor(
+            self.repo, {"demo_write": self.adapter}, preview_ttl=timedelta(seconds=-601),
+        )
+        preview = await expired_executor.prepare(self.actor, ActionProposal("demo_write", {"amount": 100}))
+        with self.assertRaises(OperationExpired):
+            await expired_executor.confirm(self.actor, preview.operation_id, "k1")
+        self.assertEqual(self.adapter.commit_calls, 0)
+        self.assertEqual((await self.repo.get_for_actor(preview.operation_id, self.actor)).state,
+                         OperationState.EXPIRED)
+
+    async def test_changed_version_or_newly_denied_precheck_cannot_commit(self):
+        preview = await self.prepare()
+        self.adapter.version += 1
+        with self.assertRaises(OperationVersionConflict):
+            await self.executor.confirm(self.actor, preview.operation_id, "k1")
+        self.adapter.version -= 1
+        self.adapter.allowed = False
+        with self.assertRaises(ValidationRejected):
+            await self.executor.confirm(self.actor, preview.operation_id, "k1")
+        self.assertEqual(self.adapter.commit_calls, 0)
+
+    async def test_changed_normalized_params_with_same_version_cannot_commit(self):
+        preview = await self.prepare()
+        original_precheck = self.adapter.precheck
+
+        async def changed_precheck(actor, params):
+            original = await original_precheck(actor, params)
+            return ValidationResult(True, {"amount": original.normalized_params["amount"] + 1},
+                                    original.resource_version)
+
+        self.adapter.precheck = changed_precheck
+        with self.assertRaises(OperationVersionConflict):
+            await self.executor.confirm(self.actor, preview.operation_id, "k1")
+        self.assertEqual(self.adapter.commit_calls, 0)
+
+    async def test_two_concurrent_confirms_have_one_business_effect(self):
+        preview = await self.prepare()
+        results = await asyncio.gather(
+            self.executor.confirm(self.actor, preview.operation_id, "a"),
+            self.executor.confirm(self.actor, preview.operation_id, "b"),
+            return_exceptions=True,
+        )
+        self.assertEqual(self.adapter.commit_calls, 1)
+        self.assertEqual(sum(isinstance(item, dict) for item in results), 1)
+
+    async def test_empty_idempotency_key_is_rejected(self):
+        preview = await self.prepare()
+        with self.assertRaises(ValueError):
+            await self.executor.confirm(self.actor, preview.operation_id, " ")
+        self.assertEqual(self.adapter.commit_calls, 0)
+
+    async def test_commit_failure_is_audited_without_completion(self):
+        preview = await self.prepare()
+
+        async def failed_commit(actor, params, key):
+            raise RuntimeError("tool unavailable")
+
+        self.adapter.commit = failed_commit
+        with self.assertRaises(RuntimeError):
+            await self.executor.confirm(self.actor, preview.operation_id, "k1")
+        self.assertEqual((await self.repo.get_for_actor(preview.operation_id, self.actor)).state,
+                         OperationState.PENDING)
+        self.assertIn("tool_failed", [event["event_type"] for event in self.repo.audit_events])
 
 
 class ActorTokenTests(unittest.IsolatedAsyncioTestCase):

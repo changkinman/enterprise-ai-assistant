@@ -146,5 +146,6 @@ def build_tools(repository: InMemoryReimbursementRepository) -> list[Tool]:
     return [Tool(name=name, description=f"企业演示报销流程：{name}", handler=handler,
                  schema={"type": "object", "properties": {key: {"type": kind} for key, kind in fields.items()},
                          "required": required, "additionalProperties": False},
-                 cache_ttl=ttl, allowed_agents=frozenset({"billing"}))
+                 cache_ttl=ttl, allowed_agents=frozenset({"billing"}),
+                 executor_only=name == "submit_claim")
             for name, (handler, fields, required, ttl) in handlers.items()]
