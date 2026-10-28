@@ -28,6 +28,7 @@ from anthropic import AsyncAnthropic
 
 from core.intent_recognizer import FunnelDecisionKind, IntentCategory, IntentRecognizer, UrgencyLevel
 from core.reimbursement_harness import ReimbursementCaseHarness
+from core.operations import OperationPreview
 from core.reimbursement_models import ReimbursementAction, ReimbursementCase, ReimbursementDecision
 from core.task_planner import BusinessDomain, ExecutionMode, PlannedTask, TaskPlan, TaskPlanner
 from mcp.tool_manager import MCPToolManager
@@ -88,6 +89,7 @@ class AgentResponse:
     latency_ms:  float = 0.0
     escalate:    bool  = False   # 是否需要升级
     tool_calls:  List[ToolCallTrace] = field(default_factory=list)
+    pending_operation: Optional[OperationPreview] = None
 
 
 @dataclass
@@ -114,6 +116,7 @@ class OrchestratorResult:
     tool_calls:  List[ToolCallTrace] = field(default_factory=list)
     execution_mode: str = ExecutionMode.SINGLE.value
     clarification_state: Optional[Dict[str, Any]] = None
+    pending_operation: Optional[OperationPreview] = None
 
 
 # ── 基础 Agent ────────────────────────────────────────────────────────────────
@@ -517,6 +520,8 @@ class AgentOrchestrator:
             responses = [await self._execute_task(req, plan.tasks[0])]
 
         tool_calls = [trace for response in responses for trace in response.tool_calls]
+        pending_operations = [response.pending_operation for response in responses
+                              if response.pending_operation is not None]
         first = responses[0]
         escalated = any(
             response.escalate or bool(task.modifiers.get("escalation_requested"))
@@ -531,6 +536,7 @@ class AgentOrchestrator:
             latency_ms=(time.monotonic() - t0) * 1000,
             tool_calls=tool_calls,
             execution_mode=plan.mode.value,
+            pending_operation=pending_operations[0] if len(pending_operations) == 1 else None,
         )
 
     async def _execute_task(self, req: Request, task: PlannedTask) -> AgentResponse:
@@ -701,6 +707,7 @@ class AgentOrchestrator:
                 response = AgentResponse(
                     AgentType.BILLING, result.content, result.success, latency_ms=ms,
                     tool_calls=[ToolCallTrace(**vars(trace)) for trace in result.tool_calls],
+                    pending_operation=result.pending_operation,
                 )
             except Exception as ex:
                 ms = (time.monotonic() - t0) * 1000

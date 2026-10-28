@@ -10,12 +10,22 @@ from fastapi import HTTPException
 from api import main as api
 from core.reimbursement_harness import ReimbursementCaseHarness
 from core.reimbursement_models import ClaimState, ReimbursementCase, append_event
+from core.operations import OperationPreview, OperationState, PreviewPayload
+from datetime import datetime, timezone
 from core.reimbursement_repository import InMemoryReimbursementRepository
 from mcp.tool_manager import MCPToolManager
 from tools.loader import discover_agent_tools
 
 
 class ReimbursementApiTests(unittest.IsolatedAsyncioTestCase):
+    def test_chat_response_serializes_pending_operation(self):
+        preview = OperationPreview("op-1", "reimbursement_submit", PreviewPayload("确认报销"),
+                                   OperationState.PENDING, datetime.now(timezone.utc))
+        payload = api.ChatResponse(
+            conv_id="conv-1", response="确认报销", intent="billing", agent_type="billing",
+            escalated=False, latency_ms=1.0, pending_operation=preview,
+        ).model_dump(mode="json")
+        self.assertEqual(payload["pending_operation"]["operation_id"], "op-1")
     def setUp(self):
         self.repository = InMemoryReimbursementRepository()
         manager = MCPToolManager(api_key="test")

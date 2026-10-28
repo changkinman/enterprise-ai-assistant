@@ -19,6 +19,8 @@ from agents.agent_orchestrator import (  # noqa: E402
 from core.reimbursement_models import (  # noqa: E402
     HarnessResult, HarnessToolTrace, ReimbursementAction, ReimbursementCase,
 )
+from core.operations import OperationPreview, OperationState, PreviewPayload
+from datetime import datetime, timezone
 from core.task_planner import BusinessDomain, ExecutionMode, PlannedTask, TaskPlan  # noqa: E402
 
 
@@ -112,6 +114,16 @@ class BillingDecisionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BillingRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_billing_preview_reaches_orchestrator_result(self):
+        preview = OperationPreview("op-1", "reimbursement_submit", PreviewPayload("确认报销"),
+                                   OperationState.PENDING, datetime.now(timezone.utc))
+        harness = SimpleNamespace(handle=AsyncMock(return_value=HarnessResult(
+            "确认报销", ReimbursementCase("case-1", "u1", "c1"), [], True, preview,
+        )))
+        result = await make_orchestrator(harness).run_plan(
+            Request("报销", "u1", "c1"), TaskPlan(ExecutionMode.SINGLE, tasks=(billing_task(),)),
+        )
+        self.assertEqual(result.pending_operation.operation_id, "op-1")
     async def test_constructor_accepts_harness(self):
         harness = SimpleNamespace(handle=AsyncMock())
 

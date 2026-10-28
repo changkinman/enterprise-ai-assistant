@@ -21,10 +21,12 @@ if _ROOT not in sys.path:
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Response, UploadFile, File
+from fastapi import Depends, FastAPI, Header, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
+from core.auth import Actor, get_current_actor
+from core.operations import OperationPreview
 
 load_dotenv()
 
@@ -50,6 +52,7 @@ _tool_manager = None
 _monitor      = None
 _evaluator    = None
 _reimbursement_harness = None
+_side_effect_executor = None
 
 
 def _anthropic_cfg() -> Dict[str, Any]:
@@ -68,7 +71,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _reimbursement_harness
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _reimbursement_harness, _side_effect_executor
 
     print(BANNER, flush=True)
 
@@ -147,12 +150,23 @@ async def lifespan(app: FastAPI):
 
         from core.reimbursement_repository import InMemoryReimbursementRepository
         from core.reimbursement_harness import ReimbursementCaseHarness
+        from core.reimbursement_operation import ReimbursementSubmitOperation
+        from core.access_request import AccessRequestOperation, InMemoryAccessRequestStore
+        from core.operation_repository import PostgresOperationRepository
+        from core.side_effect_executor import SideEffectExecutor
 
         reimbursement_repository = InMemoryReimbursementRepository()
         agent_tool_names = discover_agent_tools(
             _tool_manager, dependencies={"reimbursement_repository": reimbursement_repository}
         )
-        _reimbursement_harness = ReimbursementCaseHarness(reimbursement_repository, _tool_manager)
+        _side_effect_executor = SideEffectExecutor(
+            PostgresOperationRepository(database),
+            {"reimbursement_submit": ReimbursementSubmitOperation(reimbursement_repository, _tool_manager),
+             "access_request": AccessRequestOperation(InMemoryAccessRequestStore())},
+        )
+        _reimbursement_harness = ReimbursementCaseHarness(
+            reimbursement_repository, _tool_manager, executor=_side_effect_executor,
+        )
         logger.info(f"Agent 工具已加载: {agent_tool_names}")
 
         # Agent 编排器在工具注册完成后创建，确保所有 Agent 取得完整工具目录。
@@ -235,6 +249,7 @@ class ChatResponse(BaseModel):
     knowledge_used: bool = False
     tool_calls: List[ToolCallResponse] = Field(default_factory=list)
     execution_mode: str = "single"
+    pending_operation: Optional[OperationPreview] = None
 
 
 class ReviewInput(BaseModel):
@@ -247,7 +262,93 @@ class PaymentInput(BaseModel):
     finance_user_id: str
 
 
+class AccessRequestInput(BaseModel):
+    system_name: str
+    permission: str
+    reason: str
+
+
+class DevTokenInput(BaseModel):
+    actor_id: str
+    role: str
+
+
+def _operation_executor():
+    if _side_effect_executor is None:
+        raise HTTPException(503, "服务未就绪")
+    return _side_effect_executor
+
+
+async def _operation_not_found_or_forbidden(executor, operation_id: str, actor) -> None:
+    owner_id = await executor.repository.get_owner_id(operation_id)
+    if owner_id is not None and owner_id != actor.id:
+        raise HTTPException(403, "无权访问该操作")
+    raise HTTPException(404, "操作不存在")
+
+
 # ── 路由 ──────────────────────────────────────────────────────────────────────
+@app.post("/auth/dev-token")
+async def issue_dev_token(body: DevTokenInput):
+    from core.auth import Actor, AuthenticationError, create_dev_access_token
+
+    if os.environ.get("APP_ENV") != "development":
+        raise HTTPException(404, "Not found")
+    if not body.actor_id.strip() or body.role not in {"employee", "manager"}:
+        raise HTTPException(422, "Invalid actor")
+    try:
+        return {"access_token": create_dev_access_token(Actor(body.actor_id, body.role)),
+                "token_type": "bearer"}
+    except AuthenticationError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.post("/access-requests/prepare")
+async def prepare_access_request(body: AccessRequestInput,
+                                 actor: Actor = Depends(get_current_actor)):
+    from core.operations import ActionProposal, ValidationRejected
+
+    executor = _operation_executor()
+    try:
+        return await executor.prepare(actor, ActionProposal("access_request", body.model_dump()))
+    except ValidationRejected as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/operations/{operation_id}")
+async def get_operation(operation_id: str,
+                        actor: Actor = Depends(get_current_actor)):
+    from core.operations import OperationNotFound
+
+    executor = _operation_executor()
+    try:
+        return await executor.get_preview(actor, operation_id)
+    except OperationNotFound:
+        await _operation_not_found_or_forbidden(executor, operation_id, actor)
+
+
+@app.post("/operations/{operation_id}/confirm")
+async def confirm_operation(
+    operation_id: str,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    actor: Actor = Depends(get_current_actor),
+):
+    from core.operations import (
+        IdempotencyConflict, OperationExpired, OperationNotFound,
+        OperationStateConflict, OperationVersionConflict, ValidationRejected,
+    )
+
+    executor = _operation_executor()
+    try:
+        return await executor.confirm(actor, operation_id, idempotency_key)
+    except OperationNotFound:
+        await _operation_not_found_or_forbidden(executor, operation_id, actor)
+    except (OperationExpired, OperationStateConflict, OperationVersionConflict,
+            IdempotencyConflict, ValidationRejected) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.get("/reimbursements/{case_id}")
 async def get_reimbursement_case(case_id: str):
     if _reimbursement_harness is None:
@@ -360,6 +461,7 @@ async def chat(req: ChatRequest):
         latency_ms=round(result.latency_ms, 1),
         knowledge_used=knowledge_used,
         execution_mode=result.execution_mode,
+        pending_operation=result.pending_operation,
         tool_calls=[
             ToolCallResponse(**{
                 "round": trace.round,

@@ -28,6 +28,8 @@ class OperationRepository(Protocol):
 
     async def get_for_actor(self, operation_id: str, actor: Actor) -> StoredOperation | None: ...
 
+    async def get_owner_id(self, operation_id: str) -> str | None: ...
+
     async def expire_pending(self, operation_id: str, actor: Actor) -> StoredOperation | None: ...
 
     async def lock_for_confirmation(
@@ -123,6 +125,11 @@ class InMemoryOperationRepository:
             if operation is None or operation.actor_id != actor.id:
                 return None
             return deepcopy(self._expire(operation))
+
+    async def get_owner_id(self, operation_id: str) -> str | None:
+        async with self._lock:
+            operation = self._operations.get(operation_id)
+            return operation.actor_id if operation is not None else None
 
     async def expire_pending(self, operation_id: str, actor: Actor) -> StoredOperation | None:
         return await self.get_for_actor(operation_id, actor)
@@ -272,6 +279,12 @@ class PostgresOperationRepository:
                 operation_id, actor.id,
             )
             return await self._expire_if_needed(self._operation(row), connection) if row else None
+
+    async def get_owner_id(self, operation_id: str) -> str | None:
+        async with self._connection(None) as connection:
+            return await connection.fetchval(
+                "SELECT actor_id FROM operations WHERE operation_id=$1", operation_id,
+            )
 
     async def expire_pending(self, operation_id: str, actor: Actor) -> StoredOperation | None:
         # This method deliberately owns its transaction; never pass the failed business connection.
