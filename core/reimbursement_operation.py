@@ -1,5 +1,7 @@
 """Previewed reimbursement submission backed by the governed billing tool."""
 
+from copy import deepcopy
+
 from core.auth import Actor
 from core.operations import PreviewPayload, ValidationResult
 from core.reimbursement_models import ClaimState
@@ -28,29 +30,38 @@ class ReimbursementSubmitOperation:
         remaining = await self.repository.remaining_budget(case.department)
         if remaining < validation["required_budget"]:
             return ValidationResult(False, reason="部门预算不足")
-        return ValidationResult(True, {"case_id": case.case_id, "conv_id": case.conv_id},
-                                case.material_version)
+        return ValidationResult(
+            True,
+            {"case_id": case.case_id, "conv_id": case.conv_id,
+             "material_version": case.material_version,
+             "items": deepcopy(case.expenses),
+             "total_amount": validation["total_amount"],
+             "policy_reference": "DEMO-TRAVEL-2026",
+             "remaining_budget": remaining,
+             "budget_after_submission": remaining - validation["required_budget"]},
+            case.material_version,
+        )
 
     async def build_preview(self, actor: Actor, normalized_params: dict,
                             validation: ValidationResult) -> PreviewPayload:
-        case = await self.repository.get_case(normalized_params["case_id"])
-        checked = _validate(case)
-        remaining = await self.repository.remaining_budget(case.department)
         return PreviewPayload(
-            f"报销单待确认：共 {checked['total_amount']} 元，确认后将占用部门预算。",
-            {"case_id": case.case_id, "items": case.expenses,
-             "total_amount": checked["total_amount"],
-             "policy_reference": "DEMO-TRAVEL-2026",
-             "remaining_budget": remaining,
-             "budget_after_submission": remaining - checked["required_budget"]},
+            f"报销单待确认：共 {normalized_params['total_amount']} 元，确认后将占用部门预算。",
+            {key: deepcopy(normalized_params[key]) for key in (
+                "case_id", "items", "total_amount", "policy_reference",
+                "remaining_budget", "budget_after_submission")},
         )
 
     async def commit(self, actor: Actor, normalized_params: dict,
                      idempotency_key: str) -> dict:
+        case = await self.repository.get_case(normalized_params["case_id"])
+        if case is None:
+            raise ValueError("报销单不存在")
         result = await self.tool_manager.call(
             "submit_claim",
             {"case_id": normalized_params["case_id"], "idempotency_key": idempotency_key},
-            {"user_id": actor.id, "conv_id": normalized_params["conv_id"], "confirmed": True},
+            {"user_id": actor.id, "conv_id": normalized_params["conv_id"], "confirmed": True,
+             "expected_case_version": case.version,
+             "expected_material_version": normalized_params["material_version"]},
             caller_agent="billing", executor_authorized=True, use_cache=False,
         )
         if not result.success:

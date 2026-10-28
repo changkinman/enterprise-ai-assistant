@@ -113,6 +113,7 @@ class InMemoryReimbursementRepository:
         user_id: str,
         conv_id: str,
         validator: Callable[[ReimbursementCase], dict[str, Any]],
+        *, expected_case_version: int, expected_material_version: int,
     ) -> dict[str, Any]:
         """Validate and submit under one lock so budget and idempotency cannot race."""
         async with self._lock:
@@ -137,6 +138,9 @@ class InMemoryReimbursementRepository:
                 raise ValueError("部门预算数据无效")
             if available < amount:
                 raise ValueError("部门预算不足")
+            if (case.version != expected_case_version
+                    or case.material_version != expected_material_version):
+                raise ValueError("报销单预览已过期")
             self._budgets[case.department] = available - amount
             self._reserved_amounts[case.case_id] = amount
             case.claim_no = f"CLM-{uuid4().hex[:12].upper()}"

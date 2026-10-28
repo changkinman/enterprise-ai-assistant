@@ -6,7 +6,7 @@ from uuid import uuid4
 
 sys.modules.setdefault("anthropic", SimpleNamespace(AsyncAnthropic=lambda **_: None))
 
-from core.reimbursement_models import ClaimState, ReimbursementAction, ReimbursementDecision
+from core.reimbursement_models import ClaimState, ReimbursementAction, ReimbursementDecision, append_event
 from core.reimbursement_repository import InMemoryReimbursementRepository
 from core.reimbursement_harness import ReimbursementCaseHarness
 from core.auth import Actor
@@ -74,6 +74,59 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
             await self.harness.executor.confirm(
                 Actor("emp-001", "employee"), ready.pending_operation.operation_id,
                 "submit-after-repository-edit")
+
+    async def test_edit_between_confirm_precheck_and_commit_cannot_reserve_budget(self):
+        ready = await self.ready()
+        adapter = self.harness.executor.adapters["reimbursement_submit"]
+        original_commit = adapter.commit
+
+        async def edit_before_commit(actor, params, key):
+            case = await self.repo.get_case(ready.case.case_id)
+            case.expenses[0]["amount"] = 700
+            await self.repo.save_case(case)
+            return await original_commit(actor, params, key)
+
+        adapter.commit = edit_before_commit
+        with self.assertRaises(ValueError):
+            await self.harness.executor.confirm(
+                Actor("emp-001", "employee"), ready.pending_operation.operation_id,
+                "submit-after-precheck")
+        case = await self.repo.get_case(ready.case.case_id)
+        self.assertEqual(case.state, ClaimState.AWAITING_CONFIRMATION)
+        self.assertIsNone(case.claim_no)
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 3000)
+
+    async def test_preview_uses_prechecked_expenses_if_case_changes_during_prepare(self):
+        ready = await self.ready()
+        adapter = self.harness.executor.adapters["reimbursement_submit"]
+        actor = Actor("emp-001", "employee")
+        validation = await adapter.precheck(actor, {"case_id": ready.case.case_id})
+        case = await self.repo.get_case(ready.case.case_id)
+        case.expenses[0]["amount"] = 700
+        await self.repo.save_case(case)
+        preview = await adapter.build_preview(actor, validation.normalized_params, validation)
+        self.assertEqual(preview.details["items"][0]["amount"], 600)
+        self.assertEqual(preview.details["total_amount"], 600.0)
+
+    async def test_case_version_change_before_locked_reservation_rejects_submit(self):
+        ready = await self.ready()
+        original_call = self.manager.call
+
+        async def add_event_before_tool(name, params, context=None, **kwargs):
+            if name == "submit_claim":
+                case = await self.repo.get_case(ready.case.case_id)
+                append_event(case, "status_checked", {})
+                await self.repo.save_case(case)
+            return await original_call(name, params, context, **kwargs)
+
+        self.manager.call = add_event_before_tool
+        with self.assertRaises(ValueError):
+            await self.harness.executor.confirm(
+                Actor("emp-001", "employee"), ready.pending_operation.operation_id,
+                "submit-after-status-event")
+        case = await self.repo.get_case(ready.case.case_id)
+        self.assertEqual(case.state, ClaimState.AWAITING_CONFIRMATION)
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 3000)
 
     async def test_unvalidated_case_cannot_create_submission_preview(self):
         case = await self.repo.get_or_create_active_case("emp-001", "conv-1")
