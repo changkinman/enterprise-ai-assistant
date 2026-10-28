@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+from core.operations import OperationPreview
 
 
 EXPENSE_TYPES = {
@@ -69,6 +70,7 @@ class HarnessResult:
     case: "ReimbursementCase"
     tool_calls: list[HarnessToolTrace]
     success: bool
+    pending_operation: OperationPreview | None = None
 
 
 @dataclass
@@ -92,6 +94,7 @@ class ReimbursementCase:
     budget_reserved: bool = False
     claim_no: str | None = None
     version: int = 0
+    material_version: int = 0
     events: list[ExecutionEvent] = field(default_factory=list)
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()

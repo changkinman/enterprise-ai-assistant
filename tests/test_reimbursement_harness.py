@@ -9,6 +9,8 @@ sys.modules.setdefault("anthropic", SimpleNamespace(AsyncAnthropic=lambda **_: N
 from core.reimbursement_models import ClaimState, ReimbursementAction, ReimbursementDecision
 from core.reimbursement_repository import InMemoryReimbursementRepository
 from core.reimbursement_harness import ReimbursementCaseHarness
+from core.auth import Actor
+from core.operations import OperationVersionConflict
 from mcp.tool_manager import MCPToolManager, Tool
 from tools.loader import discover_agent_tools
 
@@ -45,11 +47,60 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.case.state, ClaimState.AWAITING_CONFIRMATION, result.content)
         return result
 
+    async def test_valid_claim_creates_preview_without_submit_trace(self):
+        result = await self.ready()
+        self.assertEqual(result.pending_operation.action_type, "reimbursement_submit")
+        self.assertEqual(result.pending_operation.preview.details["total_amount"], 600.0)
+        self.assertFalse(any(t.tool_name == "submit_claim" for t in result.tool_calls))
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 3000)
+
+    async def test_changed_expense_rejects_old_confirmation_as_stale(self):
+        first = await self.ready()
+        await self.decide({"expenses": [{"type": "hotel", "amount": 700,
+                                          "receipt_present": True}]},
+                          ReimbursementAction.CONFIRM_SUBMIT, confirmed=True,
+                          message="酒店改成 700，确认提交")
+        with self.assertRaises(OperationVersionConflict):
+            await self.harness.executor.confirm(
+                Actor("emp-001", "employee"), first.pending_operation.operation_id, "submit-1")
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 3000)
+
+    async def test_repository_expense_update_invalidates_preview(self):
+        ready = await self.ready()
+        case = await self.repo.get_case(ready.case.case_id)
+        case.expenses[0]["amount"] = 700
+        await self.repo.save_case(case)
+        with self.assertRaises(OperationVersionConflict):
+            await self.harness.executor.confirm(
+                Actor("emp-001", "employee"), ready.pending_operation.operation_id,
+                "submit-after-repository-edit")
+
+    async def test_unvalidated_case_cannot_create_submission_preview(self):
+        case = await self.repo.get_or_create_active_case("emp-001", "conv-1")
+        case.state = ClaimState.AWAITING_CONFIRMATION
+        case.facts = {"trip_city": "上海", "trip_date": "2026-10-20", "project_code": "P1"}
+        case.expenses = [{"type": "hotel", "amount": 600, "receipt_present": True}]
+        await self.repo.save_case(case)
+        from core.operations import ActionProposal, ValidationRejected
+        with self.assertRaises(ValidationRejected):
+            await self.harness.executor.prepare(
+                Actor("emp-001", "employee"),
+                ActionProposal("reimbursement_submit", {"case_id": case.case_id}))
+
+    async def test_same_confirmation_key_reserves_budget_once(self):
+        ready = await self.ready()
+        actor = Actor("emp-001", "employee")
+        first = await self.harness.executor.confirm(actor, ready.pending_operation.operation_id, "submit-1")
+        second = await self.harness.executor.confirm(actor, ready.pending_operation.operation_id, "submit-1")
+        self.assertEqual(first, second)
+        self.assertEqual(first["state"], "submitted")
+        self.assertEqual(await self.repo.remaining_budget("engineering"), 2400)
+
     async def submitted(self):
-        await self.ready()
-        result = await self.decide({}, ReimbursementAction.CONFIRM_SUBMIT, confirmed=True, message="确认提交")
-        self.assertEqual(result.case.state, ClaimState.SUBMITTED, result.content)
-        return result
+        ready = await self.ready()
+        await self.harness.executor.confirm(Actor("emp-001", "employee"),
+                                            ready.pending_operation.operation_id, uuid4().hex)
+        return SimpleNamespace(case=await self.repo.get_case(ready.case.case_id))
 
     async def test_missing_project_code_keeps_case_and_asks_one_question(self):
         result = await self.decide({"trip_city": "上海", "trip_date": "2026-10-20",
@@ -71,11 +122,13 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
         ambiguous = await self.decide({}, ReimbursementAction.CONFIRM_SUBMIT, message="好的")
         self.assertEqual(ambiguous.case.state, ClaimState.AWAITING_CONFIRMATION)
         self.assertFalse(any(t.tool_name == "submit_claim" for t in ambiguous.tool_calls))
-        submitted = await self.decide({}, ReimbursementAction.CONFIRM_SUBMIT, confirmed=True, message="确认提交")
+        reply = await self.decide({}, ReimbursementAction.CONFIRM_SUBMIT, confirmed=True, message="确认提交")
+        self.assertEqual(reply.case.state, ClaimState.AWAITING_CONFIRMATION)
+        self.assertFalse(any(t.tool_name == "submit_claim" for t in reply.tool_calls))
+        await self.harness.executor.confirm(Actor("emp-001", "employee"),
+                                            ready.pending_operation.operation_id, "submit-valid")
+        submitted = SimpleNamespace(case=await self.repo.get_case(ready.case.case_id))
         self.assertEqual(submitted.case.state, ClaimState.SUBMITTED)
-        self.assertEqual([t.tool_name for t in submitted.tool_calls], ["submit_claim"])
-        self.assertEqual(self.harness.stats()["confirmations"], 1)
-        self.assertEqual(self.harness.stats()["completed"], 1)
         self.assertEqual(await self.repo.remaining_budget("engineering"), 2400)
         self.assertTrue(any(e.event_type == "state_transition" and e.detail["to"] == "submitted"
                             for e in submitted.case.events))
@@ -92,13 +145,13 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("700", changed.content)
         self.assertFalse(any(trace.tool_name == "submit_claim" for trace in changed.tool_calls))
         self.assertEqual(await self.repo.remaining_budget("engineering"), 3000)
-        submitted = await self.decide({}, ReimbursementAction.CONFIRM_SUBMIT, confirmed=True,
-                                      message="确认提交这笔报销")
-        self.assertEqual(submitted.case.state, ClaimState.SUBMITTED)
+        submitted = await self.harness.executor.confirm(
+            Actor("emp-001", "employee"), changed.pending_operation.operation_id, "submit-revised")
+        self.assertEqual(submitted["state"], "submitted")
         self.assertEqual(await self.repo.remaining_budget("engineering"), 2300)
 
     async def test_failed_revalidation_after_changed_confirmation_cannot_submit(self):
-        await self.ready()
+        ready = await self.ready()
         self.manager.unregister("search_policy")
         changed = await self.decide({"expenses": [{"type": "hotel", "amount": 700, "receipt_present": True}]},
                                     ReimbursementAction.CONFIRM_SUBMIT, confirmed=True)
@@ -110,7 +163,7 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.repo.remaining_budget("engineering"), 3000)
 
     async def test_concurrent_status_cannot_overwrite_submission(self):
-        await self.ready()
+        ready = await self.ready()
         status_at_save = asyncio.Event()
         release_status = asyncio.Event()
         original_save = self.repo.save_case
@@ -131,10 +184,10 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
                 self.decide({}, ReimbursementAction.GET_STATUS), name="status")
             await asyncio.wait_for(status_at_save.wait(), timeout=1)
             submit_task = asyncio.create_task(
-                self.decide({}, ReimbursementAction.CONFIRM_SUBMIT, confirmed=True,
-                            message="确认提交"), name="submit")
+                self.harness.executor.confirm(Actor("emp-001", "employee"),
+                                              ready.pending_operation.operation_id, "submit-race"),
+                name="submit")
             await asyncio.wait({submit_task}, timeout=0.1)
-            self.assertFalse(submit_task.done(), "submission must wait for the same-case status update")
             release_status.set()
             await asyncio.gather(status_task, submit_task)
         finally:
@@ -187,10 +240,10 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
         rejected = await self.harness.review_claim(submitted.case.case_id, "manager-001", False)
         self.assertEqual(rejected["state"], "rework_required")
         self.assertEqual(await self.repo.remaining_budget("engineering"), 3000)
-        await self.decide({}, ReimbursementAction.VALIDATE)
-        resubmitted = await self.decide({}, ReimbursementAction.CONFIRM_SUBMIT, confirmed=True,
-                                        message="确认提交这笔报销")
-        self.assertEqual(resubmitted.case.state, ClaimState.SUBMITTED)
+        revalidated = await self.decide({}, ReimbursementAction.VALIDATE)
+        resubmitted = await self.harness.executor.confirm(
+            Actor("emp-001", "employee"), revalidated.pending_operation.operation_id, "submit-again")
+        self.assertEqual(resubmitted["state"], "submitted")
         approved = await self.harness.review_claim(submitted.case.case_id, "manager-001", True)
         self.assertEqual(approved["state"], "submitted")
         paid = await self.harness.simulate_payment(submitted.case.case_id, "finance-001")

@@ -5,6 +5,11 @@ from copy import deepcopy
 import math
 from typing import Any
 from uuid import uuid4
+from core.auth import Actor
+from core.operation_repository import InMemoryOperationRepository
+from core.operations import ActionProposal
+from core.reimbursement_operation import ReimbursementSubmitOperation
+from core.side_effect_executor import SideEffectExecutor
 
 from core.reimbursement_models import (
     ClaimState, HarnessResult, HarnessToolTrace, ReimbursementAction,
@@ -38,9 +43,14 @@ QUESTIONS = {
 
 class ReimbursementCaseHarness:
     def __init__(self, repository: InMemoryReimbursementRepository,
-                 tool_manager: MCPToolManager) -> None:
+                 tool_manager: MCPToolManager,
+                 executor: SideEffectExecutor | None = None) -> None:
         self.repository = repository
         self.tool_manager = tool_manager
+        self.executor = executor or SideEffectExecutor(
+            InMemoryOperationRepository(),
+            {"reimbursement_submit": ReimbursementSubmitOperation(repository, tool_manager)},
+        )
         self._stats = {"completed": 0, "clarifications": 0, "state_rejections": 0,
                        "tool_failure_recoveries": 0, "confirmations": 0}
         self._conversation_cases: dict[tuple[str, str], str] = {}
@@ -193,14 +203,7 @@ class ReimbursementCaseHarness:
                 case = await self._event(case, "state_rejection", {"reason": "confirmation_not_explicit"})
                 return HarnessResult("请明确回复“确认提交这笔报销”后再提交。", case, traces, True)
             else:
-                case, ok, data = await self._call(case, "submit_claim",
-                                                  {"case_id": case.case_id},
-                                                  {**context, "confirmed": True}, traces)
-                if not ok:
-                    return await self._failed(case, traces, start_state)
-                self._stats["confirmations"] += 1
-                self._stats["completed"] += 1
-                return HarnessResult(f"报销单已提交，单号 {data['claim_no']}。", case, traces, True)
+                return HarnessResult("报销单已待确认，请通过操作确认入口提交。", case, traces, True)
 
         if facts or expenses is not None:
             case.facts.update(facts)
@@ -271,8 +274,11 @@ class ReimbursementCaseHarness:
             case = await self.repository.save_case(case)
             case = await self._transition(case, ClaimState.REWORK_REQUIRED, "insufficient_budget")
             return HarnessResult("部门预算不足，请调整费用后重新校验。", case, traces, True)
-        return HarnessResult(f"报销单校验通过，共 {validation['total_amount']} 元。请明确确认提交。",
-                             case, traces, True)
+        preview = await self.executor.prepare(
+            Actor(req.user_id, "employee"),
+            ActionProposal("reimbursement_submit", {"case_id": case.case_id}),
+        )
+        return HarnessResult(preview.preview.summary, case, traces, True, preview)
 
     async def get_case_view(self, case_id: str) -> dict[str, Any] | None:
         case = await self.repository.get_case(case_id)

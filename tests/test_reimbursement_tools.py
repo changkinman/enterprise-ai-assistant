@@ -22,7 +22,8 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
         discover_agent_tools(self.manager, dependencies={"reimbursement_repository": self.repo})
 
     async def call(self, name, params, context=None, agent="billing"):
-        return await self.manager.call(name, params, context or CONTEXT, caller_agent=agent)
+        return await self.manager.call(name, params, context or CONTEXT, caller_agent=agent,
+                                       executor_authorized=name == "submit_claim")
 
     async def ready_case(self, expenses=None):
         case = await self.repo.get_or_create_active_case("emp-001", "conv-1")
