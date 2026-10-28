@@ -33,7 +33,12 @@ class VectorStore:
                 metadata.setdefault("chunk_index", metadata.get("chunk", 0))
                 await conn.execute(
                     """INSERT INTO knowledge_chunks (id, title, content, metadata, embedding)
-                       VALUES ($1, $2, $3, $4::jsonb, $5)""",
+                       VALUES ($1, $2, $3, $4::jsonb, $5)
+                       ON CONFLICT (id) DO UPDATE SET
+                           title = EXCLUDED.title,
+                           content = EXCLUDED.content,
+                           metadata = EXCLUDED.metadata,
+                           embedding = EXCLUDED.embedding""",
                     chunk["id"], title, chunk["content"], metadata, vector,
                 )
         return len(chunks)

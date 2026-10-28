@@ -1,10 +1,12 @@
 import asyncio
+import sys
 from contextlib import asynccontextmanager
 import threading
 import types
 import unittest
 from unittest.mock import patch
 
+from api.main import lifespan
 from core.database import DatabaseSettings
 from core.embeddings import SentenceTransformerEmbeddingProvider
 from core.vector_store import VectorStore
@@ -243,3 +245,143 @@ class KnowledgeBaseCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         populated = FakeKnowledgeStore(count=2)
         await KnowledgeBase(populated).ensure_default_documents()
         self.assertEqual(populated.saved, [])
+
+
+class UniqueKnowledgeConnection(FakeConnection):
+    def __init__(self):
+        super().__init__()
+        self.knowledge = {}
+        self.count_calls = 0
+        self.both_counted = asyncio.Event()
+
+    async def fetchval(self, sql, *args):
+        observed_count = len(self.knowledge)
+        self.count_calls += 1
+        if self.count_calls <= 2:
+            if self.count_calls == 2:
+                self.both_counted.set()
+            await self.both_counted.wait()
+        return observed_count
+
+    async def execute(self, sql, *args):
+        if "INSERT INTO knowledge_chunks" not in sql:
+            return await super().execute(sql, *args)
+        if args[0] in self.knowledge and "ON CONFLICT" not in sql:
+            raise ValueError("duplicate primary key")
+        self.knowledge[args[0]] = args[1:]
+
+
+class KnowledgeSeedConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_two_empty_observations_seed_without_duplicate_key_failure(self):
+        connection = UniqueKnowledgeConnection()
+        store = VectorStore(FakeDatabase(connection), FakeEmbeddingProvider())
+        await asyncio.gather(
+            KnowledgeBase(store).ensure_default_documents(),
+            KnowledgeBase(store).ensure_default_documents(),
+        )
+        self.assertEqual(len(connection.knowledge), 6)
+
+    async def test_reimport_updates_existing_chunk_content(self):
+        connection = UniqueKnowledgeConnection()
+        connection.count_calls = 2
+        store = VectorStore(FakeDatabase(connection), FakeEmbeddingProvider())
+        kb = KnowledgeBase(store)
+        self.assertEqual(await kb.add_documents([{"title": "制度", "content": "A" * 60}]), 1)
+        self.assertEqual(await kb.add_documents([{"title": "制度", "content": "A" * 50 + "B" * 10}]), 1)
+        self.assertEqual(len(connection.knowledge), 1)
+        self.assertEqual(next(iter(connection.knowledge.values()))[1], "A" * 50 + "B" * 10)
+
+
+class LifespanCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_database_closes_for_each_startup_failure_and_only_started_monitor_stops(self):
+        for failure_stage in ("provider", "vector", "seed", "monitor_start", "evaluator"):
+            with self.subTest(failure_stage=failure_stage):
+                databases = []
+                monitors = []
+
+                class FakeDatabase:
+                    def __init__(self):
+                        self.settings = object()
+                        self.connected = False
+                        self.closed = False
+                        databases.append(self)
+
+                    async def connect(self):
+                        self.connected = True
+
+                    async def close(self):
+                        self.closed = True
+
+                class Noop:
+                    def __init__(self, *args, **kwargs):
+                        pass
+
+                    def register(self, tool):
+                        pass
+
+                class FakeProvider(Noop):
+                    def __init__(self, *args, **kwargs):
+                        if failure_stage == "provider":
+                            raise RuntimeError("provider failed")
+
+                class FakeVector(Noop):
+                    def __init__(self, *args, **kwargs):
+                        if failure_stage == "vector":
+                            raise RuntimeError("vector failed")
+
+                class FakeKnowledgeBase(Noop):
+                    async def ensure_default_documents(self):
+                        if failure_stage == "seed":
+                            raise RuntimeError("seed failed")
+
+                    async def doc_count(self):
+                        return 1
+
+                    async def search_handler(self, params, context):
+                        return []
+
+                class FakeMonitor(Noop):
+                    def __init__(self, *args, **kwargs):
+                        self.started = False
+                        self.stopped = False
+                        monitors.append(self)
+
+                    async def start(self):
+                        if failure_stage == "monitor_start":
+                            raise RuntimeError("monitor failed")
+                        self.started = True
+
+                    async def stop(self):
+                        self.stopped = True
+
+                class FakeEvaluator(Noop):
+                    def __init__(self, *args, **kwargs):
+                        if failure_stage == "evaluator":
+                            raise RuntimeError("evaluator failed")
+
+                modules = {
+                    "agents.agent_orchestrator": types.SimpleNamespace(AgentOrchestrator=Noop, Request=Noop),
+                    "core.database": types.SimpleNamespace(Database=FakeDatabase),
+                    "core.embeddings": types.SimpleNamespace(SentenceTransformerEmbeddingProvider=FakeProvider),
+                    "core.intent_recognizer": types.SimpleNamespace(IntentRecognizer=Noop),
+                    "core.vector_store": types.SimpleNamespace(VectorStore=FakeVector),
+                    "evaluation.evaluator": types.SimpleNamespace(EndToEndEvaluator=FakeEvaluator),
+                    "mcp.knowledge_base": types.SimpleNamespace(KnowledgeBase=FakeKnowledgeBase),
+                    "mcp.tool_manager": types.SimpleNamespace(MCPToolManager=Noop, Tool=Noop),
+                    "memory.conversation_memory": types.SimpleNamespace(MemoryManager=Noop),
+                    "monitor.performance_monitor": types.SimpleNamespace(PerformanceMonitor=FakeMonitor),
+                    "tools.loader": types.SimpleNamespace(discover_agent_tools=lambda *a, **k: []),
+                    "core.reimbursement_repository": types.SimpleNamespace(InMemoryReimbursementRepository=Noop),
+                    "core.reimbursement_harness": types.SimpleNamespace(ReimbursementCaseHarness=Noop),
+                }
+                with patch.dict(sys.modules, modules), patch("api.main.BANNER", "banner"), \
+                     patch("api.main._anthropic_cfg", return_value={
+                         "api_key": "fake", "model": "fake"}):
+                    with self.assertRaises(RuntimeError):
+                        async with lifespan(None):
+                            pass
+
+                self.assertTrue(databases[0].connected)
+                self.assertTrue(databases[0].closed)
+                if monitors:
+                    self.assertEqual(monitors[0].stopped, monitors[0].started)

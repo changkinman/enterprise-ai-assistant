@@ -10,7 +10,7 @@ import os
 import pathlib
 import sys
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 # 将项目根目录加入 sys.path，确保无论从哪里执行都能找到 agents/core/memory 等模块
@@ -86,113 +86,110 @@ async def lifespan(app: FastAPI):
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
-    database = Database()
-    await database.connect()
-    vector_store = VectorStore(database, SentenceTransformerEmbeddingProvider(database.settings))
+    async with AsyncExitStack() as cleanup:
+        database = Database()
+        await database.connect()
+        cleanup.push_async_callback(database.close)
+        vector_store = VectorStore(database, SentenceTransformerEmbeddingProvider(database.settings))
 
-    # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
-    recognizer = IntentRecognizer(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-    )
+        # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
+        recognizer = IntentRecognizer(
+            api_key=cfg["api_key"],
+            base_url=cfg.get("base_url"),
+            model=cfg["model"],
+        )
 
-    # 记忆管理器（Redis 工作记忆 + PostgreSQL 情景记忆/用户画像）
-    _memory = MemoryManager(
-        redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
-        vector_store=vector_store,
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-    )
+        # 记忆管理器（Redis 工作记忆 + PostgreSQL 情景记忆/用户画像）
+        _memory = MemoryManager(
+            redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
+            vector_store=vector_store,
+            api_key=cfg["api_key"],
+            base_url=cfg.get("base_url"),
+            model=cfg["model"],
+        )
 
-    # MCP 工具管理器 + RAG 知识库
-    _tool_manager = MCPToolManager(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-    )
-    kb = KnowledgeBase(vector_store)
-    await kb.ensure_default_documents()
-    logger.info("知识库已加载: %s 个文档片段", await kb.doc_count())
+        # MCP 工具管理器 + RAG 知识库
+        _tool_manager = MCPToolManager(
+            api_key=cfg["api_key"],
+            base_url=cfg.get("base_url"),
+            model=cfg["model"],
+        )
+        kb = KnowledgeBase(vector_store)
+        await kb.ensure_default_documents()
+        logger.info("知识库已加载: %s 个文档片段", await kb.doc_count())
 
-    def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
-        query = params.get("query", "")
-        return [{
-            "title": "知识库降级结果",
-            "content": f"知识库暂时不可用，未能完成对“{query}”的语义检索。请稍后重试，或转人工客服确认。",
-            "score": 0.0,
-            "fallback": True,
-            "error": error,
-        }]
+        def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
+            query = params.get("query", "")
+            return [{
+                "title": "知识库降级结果",
+                "content": f"知识库暂时不可用，未能完成对“{query}”的语义检索。请稍后重试，或转人工客服确认。",
+                "score": 0.0,
+                "fallback": True,
+                "error": error,
+            }]
 
-    _tool_manager.register(Tool(
-        name="knowledge_search",
-        description="搜索知识库（基于 pgvector 向量检索）",
-        handler=kb.search_handler,
-        schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "top_k": {"type": "integer"},
+        _tool_manager.register(Tool(
+            name="knowledge_search",
+            description="搜索知识库（基于 pgvector 向量检索）",
+            handler=kb.search_handler,
+            schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "top_k": {"type": "integer"},
+                },
+                "required": ["query"],
             },
-            "required": ["query"],
-        },
-        cache_ttl=300.0,
-        supports_rerank=True,
-        fallback=knowledge_fallback,
-    ))
+            cache_ttl=300.0,
+            supports_rerank=True,
+            fallback=knowledge_fallback,
+        ))
 
-    from core.reimbursement_repository import InMemoryReimbursementRepository
-    from core.reimbursement_harness import ReimbursementCaseHarness
+        from core.reimbursement_repository import InMemoryReimbursementRepository
+        from core.reimbursement_harness import ReimbursementCaseHarness
 
-    reimbursement_repository = InMemoryReimbursementRepository()
-    agent_tool_names = discover_agent_tools(
-        _tool_manager, dependencies={"reimbursement_repository": reimbursement_repository}
-    )
-    _reimbursement_harness = ReimbursementCaseHarness(reimbursement_repository, _tool_manager)
-    logger.info(f"Agent 工具已加载: {agent_tool_names}")
+        reimbursement_repository = InMemoryReimbursementRepository()
+        agent_tool_names = discover_agent_tools(
+            _tool_manager, dependencies={"reimbursement_repository": reimbursement_repository}
+        )
+        _reimbursement_harness = ReimbursementCaseHarness(reimbursement_repository, _tool_manager)
+        logger.info(f"Agent 工具已加载: {agent_tool_names}")
 
-    # Agent 编排器在工具注册完成后创建，确保所有 Agent 取得完整工具目录。
-    _orchestrator = AgentOrchestrator(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-        tool_manager=_tool_manager,
-        reimbursement_harness=_reimbursement_harness,
-        max_tool_rounds=int(os.getenv("MAX_TOOL_ROUNDS", "5")),
-    )
-    # 性能监控（可选启动 Prometheus）
-    prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
-    _monitor = PerformanceMonitor(
-        orchestrator=_orchestrator,
-        tool_manager=_tool_manager,
-        interval_s=float(os.getenv("MONITOR_INTERVAL", "10")),
-        webhook_url=os.getenv("ALERT_WEBHOOK_URL") or None,
-        prometheus_port=prom_port,
-    )
-    await _monitor.start()
+        # Agent 编排器在工具注册完成后创建，确保所有 Agent 取得完整工具目录。
+        _orchestrator = AgentOrchestrator(
+            api_key=cfg["api_key"],
+            base_url=cfg.get("base_url"),
+            model=cfg["model"],
+            tool_manager=_tool_manager,
+            reimbursement_harness=_reimbursement_harness,
+            max_tool_rounds=int(os.getenv("MAX_TOOL_ROUNDS", "5")),
+        )
+        # 性能监控（可选启动 Prometheus）
+        prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
+        _monitor = PerformanceMonitor(
+            orchestrator=_orchestrator,
+            tool_manager=_tool_manager,
+            interval_s=float(os.getenv("MONITOR_INTERVAL", "10")),
+            webhook_url=os.getenv("ALERT_WEBHOOK_URL") or None,
+            prometheus_port=prom_port,
+        )
+        await _monitor.start()
+        cleanup.push_async_callback(_monitor.stop)
 
-    # 评测器
-    _evaluator = EndToEndEvaluator(
-        orchestrator=_orchestrator,
-        recognizer=recognizer,
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-        baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
-    )
+        # 评测器
+        _evaluator = EndToEndEvaluator(
+            orchestrator=_orchestrator,
+            recognizer=recognizer,
+            api_key=cfg["api_key"],
+            base_url=cfg.get("base_url"),
+            model=cfg["model"],
+            baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
+        )
 
-    logger.info("EchoMind 已就绪")
-    try:
+        logger.info("EchoMind 已就绪")
         yield
-    finally:
-        try:
-            await _monitor.stop()
-        finally:
-            await database.close()
-            logger.info("EchoMind 已关闭")
 
+    logger.info("EchoMind 已关闭")
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI(
