@@ -11,7 +11,7 @@ from uuid import uuid4
 from core.auth import Actor
 from core.database import Database
 from core.operations import (
-    IdempotencyConflict, OperationState, OperationStateConflict,
+    IdempotencyConflict, OperationExpired, OperationState, OperationStateConflict,
     PreviewPayload, StoredOperation,
 )
 
@@ -25,6 +25,8 @@ class OperationRepository(Protocol):
     ) -> StoredOperation: ...
 
     async def get_for_actor(self, operation_id: str, actor: Actor) -> StoredOperation | None: ...
+
+    async def expire_pending(self, operation_id: str, actor: Actor) -> StoredOperation | None: ...
 
     async def lock_for_confirmation(
         self, operation_id: str, actor: Actor, connection: Any,
@@ -66,8 +68,12 @@ class InMemoryOperationRepository:
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[object]:
-        async with self._lock:
-            yield self._transaction_marker
+        try:
+            async with self._lock:
+                yield self._transaction_marker
+        except OperationExpired as exc:
+            await self.expire_pending(exc.operation_id, exc.actor)
+            raise
 
     @asynccontextmanager
     async def _guard(self, connection: Any) -> AsyncIterator[None]:
@@ -106,6 +112,9 @@ class InMemoryOperationRepository:
                 return None
             return deepcopy(self._expire(operation))
 
+    async def expire_pending(self, operation_id: str, actor: Actor) -> StoredOperation | None:
+        return await self.get_for_actor(operation_id, actor)
+
     async def lock_for_confirmation(
         self, operation_id: str, actor: Actor, connection: Any = None,
     ) -> StoredOperation | None:
@@ -113,7 +122,9 @@ class InMemoryOperationRepository:
             operation = self._operations.get(operation_id)
             if operation is None or operation.actor_id != actor.id:
                 return None
-            return deepcopy(self._expire(operation))
+            if operation.state is OperationState.PENDING and operation.expires_at <= datetime.now(timezone.utc):
+                raise OperationExpired(operation_id, actor)
+            return deepcopy(operation)
 
     async def load_idempotency(
         self, actor: Actor, action_type: str, key: str, request_hash: str,
@@ -148,7 +159,10 @@ class InMemoryOperationRepository:
             operation = self._operations.get(operation_id)
             if operation is None or operation.actor_id != actor.id:
                 raise OperationStateConflict("Operation is unavailable")
-            operation = self._expire(operation)
+            if operation.state is OperationState.PENDING and operation.expires_at <= datetime.now(timezone.utc):
+                if connection is not self._transaction_marker:
+                    self._expire(operation)
+                raise OperationExpired(operation_id, actor)
             if operation.state is not OperationState.PENDING:
                 raise OperationStateConflict("Operation is not pending")
             completed = replace(operation, state=OperationState.COMPLETED)
@@ -172,8 +186,15 @@ class PostgresOperationRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    def transaction(self):
-        return self.database.transaction()
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[Any]:
+        try:
+            async with self.database.transaction() as connection:
+                yield connection
+        except OperationExpired as exc:
+            # The business transaction has rolled back. Expire/audit in its own transaction.
+            await self.expire_pending(exc.operation_id, exc.actor)
+            raise
 
     @staticmethod
     def _operation(row: Any) -> StoredOperation:
@@ -211,15 +232,17 @@ class PostgresOperationRepository:
             return self._operation(row)
 
     async def _expire_if_needed(self, operation: StoredOperation, connection: Any) -> StoredOperation:
-        if operation.state is OperationState.PENDING and operation.expires_at <= datetime.now(timezone.utc):
-            await connection.execute(
-                "UPDATE operations SET state='expired', updated_at=now() WHERE operation_id=$1 AND state='pending'",
+        if operation.state is OperationState.PENDING:
+            status = await connection.execute(
+                """UPDATE operations SET state='expired', updated_at=now()
+                   WHERE operation_id=$1 AND state='pending' AND expires_at <= now()""",
                 operation.operation_id,
             )
-            await self.append_audit(
-                operation.operation_id, "preview_expired", Actor(operation.actor_id, ""), {}, connection,
-            )
-            return replace(operation, state=OperationState.EXPIRED)
+            if status == "UPDATE 1":
+                await self.append_audit(
+                    operation.operation_id, "preview_expired", Actor(operation.actor_id, ""), {}, connection,
+                )
+                return replace(operation, state=OperationState.EXPIRED)
         return operation
 
     async def get_for_actor(self, operation_id: str, actor: Actor) -> StoredOperation | None:
@@ -230,6 +253,10 @@ class PostgresOperationRepository:
             )
             return await self._expire_if_needed(self._operation(row), connection) if row else None
 
+    async def expire_pending(self, operation_id: str, actor: Actor) -> StoredOperation | None:
+        # This method deliberately owns its transaction; never pass the failed business connection.
+        return await self.get_for_actor(operation_id, actor)
+
     async def lock_for_confirmation(
         self, operation_id: str, actor: Actor, connection: Any,
     ) -> StoredOperation | None:
@@ -239,7 +266,12 @@ class PostgresOperationRepository:
             "SELECT * FROM operations WHERE operation_id=$1 AND actor_id=$2 FOR UPDATE",
             operation_id, actor.id,
         )
-        return await self._expire_if_needed(self._operation(row), connection) if row else None
+        if row is None:
+            return None
+        operation = self._operation(row)
+        if operation.state is OperationState.PENDING and operation.expires_at <= datetime.now(timezone.utc):
+            raise OperationExpired(operation_id, actor)
+        return operation
 
     async def load_idempotency(
         self, actor: Actor, action_type: str, key: str, request_hash: str,
@@ -282,10 +314,20 @@ class PostgresOperationRepository:
             row = await active.fetchrow(
                 """UPDATE operations SET state='completed', updated_at=now()
                    WHERE operation_id=$1 AND actor_id=$2 AND state='pending'
+                     AND expires_at > now()
                    RETURNING *""",
                 operation_id, actor.id,
             )
             if row is None:
+                current = await active.fetchrow(
+                    """SELECT *, (expires_at <= now()) AS is_expired FROM operations
+                       WHERE operation_id=$1 AND actor_id=$2 FOR UPDATE""",
+                    operation_id, actor.id,
+                )
+                if current is not None:
+                    operation = self._operation(current)
+                    if operation.state is OperationState.PENDING and current["is_expired"]:
+                        raise OperationExpired(operation_id, actor)
                 raise OperationStateConflict("Operation is not pending or unavailable")
             return self._operation(row)
 

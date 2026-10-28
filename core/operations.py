@@ -27,7 +27,12 @@ class OperationForbidden(OperationError):
 
 
 class OperationExpired(OperationError):
-    pass
+    """Expired preview, carrying the owner needed for durable expiry audit."""
+
+    def __init__(self, operation_id: str, actor: Actor) -> None:
+        super().__init__("Operation preview has expired")
+        self.operation_id = operation_id
+        self.actor = actor
 
 
 class OperationStateConflict(OperationError):
