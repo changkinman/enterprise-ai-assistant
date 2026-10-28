@@ -263,13 +263,14 @@ class PostgresOperationRepository:
         if connection is None:
             raise ValueError("Confirmation lock requires an active transaction connection")
         row = await connection.fetchrow(
-            "SELECT * FROM operations WHERE operation_id=$1 AND actor_id=$2 FOR UPDATE",
+            """SELECT *, (expires_at <= now()) AS is_expired FROM operations
+               WHERE operation_id=$1 AND actor_id=$2 FOR UPDATE""",
             operation_id, actor.id,
         )
         if row is None:
             return None
         operation = self._operation(row)
-        if operation.state is OperationState.PENDING and operation.expires_at <= datetime.now(timezone.utc):
+        if operation.state is OperationState.PENDING and row["is_expired"]:
             raise OperationExpired(operation_id, actor)
         return operation
 

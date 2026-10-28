@@ -117,7 +117,12 @@ class FakeConnection:
 
     async def fetchrow(self, sql, *params):
         self.statements.append((sql, params))
-        return self.row
+        if self.row is None:
+            return None
+        result = deepcopy(self.row)
+        if "AS is_expired" in sql:
+            result["is_expired"] = result["expires_at"] <= datetime.now(timezone.utc)
+        return result
 
     async def execute(self, sql, *params):
         self.statements.append((sql, params))
@@ -217,12 +222,34 @@ class PostgresOperationRepositoryTests(unittest.IsolatedAsyncioTestCase):
         }
         database = TransactionalDatabase(row)
         repository = PostgresOperationRepository(database)
-        with self.assertRaises(OperationExpired):
-            async with repository.transaction() as connection:
-                await repository.lock_for_confirmation("op-1", Actor("emp-001", "employee"), connection)
+        with patch("core.operation_repository.datetime") as app_clock:
+            app_clock.now.return_value = past - timedelta(minutes=10)
+            with self.assertRaises(OperationExpired):
+                async with repository.transaction() as connection:
+                    await repository.lock_for_confirmation("op-1", Actor("emp-001", "employee"), connection)
         self.assertEqual(database.row["state"], "expired")
         self.assertEqual(database.audit, [{"operation_id": "op-1", "event_type": "preview_expired", "actor_id": "emp-001"}])
         self.assertEqual(len(database.connections), 2)  # rolled-back business transaction, committed expiry
+
+    async def test_app_clock_ahead_does_not_falsely_expire_live_postgres_preview(self):
+        database_now = datetime.now(timezone.utc)
+        future = database_now + timedelta(minutes=10)
+        row = {
+            "operation_id": "op-1", "actor_id": "emp-001", "action_type": "access_request",
+            "params": {}, "preview": {"summary": "Apply", "details": {}},
+            "snapshot_hash": "snapshot", "resource_version": 1,
+            "state": "pending", "expires_at": future,
+        }
+        database = TransactionalDatabase(row)
+        database.now = database_now
+        repository = PostgresOperationRepository(database)
+        with patch("core.operation_repository.datetime") as app_clock:
+            app_clock.now.return_value = future + timedelta(seconds=1)
+            async with repository.transaction() as connection:
+                locked = await repository.lock_for_confirmation("op-1", Actor("emp-001", "employee"), connection)
+        self.assertEqual(locked.state, OperationState.PENDING)
+        self.assertEqual(database.row["state"], "pending")
+        self.assertEqual(database.audit, [])
 
     async def test_completion_rejects_expiry_that_occurs_after_lock(self):
         future = datetime.now(timezone.utc) + timedelta(minutes=10)
