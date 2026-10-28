@@ -12,7 +12,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONPATH=/app
 
-# curl 用于健康检查；不再需要 gcc/g++（已移除本地 ML 模型）
+# curl 用于健康检查；Python 依赖使用预编译 wheel
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
@@ -24,33 +24,22 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
-# 预下载 ChromaDB 内置的 ONNX embedding 模型（~79MB），避免运行时下载超时
-RUN mkdir -p /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2 && \
-    curl -L --retry 3 --retry-delay 5 -o /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx.tar.gz \
-    https://chroma-onnx-models.s3.amazonaws.com/all-MiniLM-L6-v2/onnx.tar.gz && \
-    cd /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2 && \
-    tar -xzf onnx.tar.gz && \
-    rm onnx.tar.gz
-
 # ── 阶段 3：生产镜像 ──────────────────────────────────────────────────────────
 FROM base AS production
 
 # 从依赖阶段复制已安装的包
 COPY --from=dependencies /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=dependencies /usr/local/bin /usr/local/bin
-# 复制预下载的 ONNX 模型缓存
-COPY --from=dependencies /root/.cache/chroma /home/echomind/.cache/chroma
 
 # 复制应用代码
 COPY . .
 
 # 创建必要目录
-RUN mkdir -p /app/data/chroma /app/logs /app/config
+RUN mkdir -p /app/data/eval /app/logs /app/config
 
 # 非 root 用户运行
 RUN useradd -m -u 1000 echomind && \
-    chown -R echomind:echomind /app && \
-    chown -R echomind:echomind /home/echomind/.cache
+    chown -R echomind:echomind /app
 USER echomind
 
 EXPOSE 8000
@@ -65,7 +54,7 @@ FROM dependencies AS development
 
 COPY . .
 
-RUN mkdir -p /app/data/chroma /app/logs /app/config /app/tests && \
+RUN mkdir -p /app/data/eval /app/logs /app/config /app/tests && \
     chmod -R 777 /app/data /app/logs
 
 EXPOSE 8000

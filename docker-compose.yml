@@ -1,5 +1,5 @@
 # EchoMind 智能客服系统 — Docker Compose 服务编排
-# 三级记忆架构：Redis（工作记忆）+ ChromaDB（情景记忆 + 用户画像）
+# 三级记忆架构：Redis（工作记忆）+ PostgreSQL/pgvector（情景记忆 + 用户画像）
 
 services:
 
@@ -21,26 +21,27 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── ChromaDB 向量数据库（情景记忆 + 用户画像）────────────────────────────────
-  chromadb:
-    image: chromadb/chroma:0.5.23
-    container_name: echomind-chromadb
+  # ── PostgreSQL + pgvector ──────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: echomind-postgres
     ports:
-      - "8001:8000"
+      - "5432:5432"
     environment:
-      - IS_PERSISTENT=TRUE
-      - PERSIST_DIRECTORY=/chroma/chroma
-      - ANONYMIZED_TELEMETRY=FALSE
+      POSTGRES_DB: ${POSTGRES_DB:-echomind}
+      POSTGRES_USER: ${POSTGRES_USER:-echomind}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
     volumes:
-      - chromadb-data:/chroma/chroma
+      - postgres-data:/var/lib/postgresql/data
+      - ./config/postgres/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
     restart: unless-stopped
     networks:
       - echomind-network
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/v1/heartbeat || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
       start_period: 10s
 
   # ── Prometheus 监控 ─────────────────────────────────────────────────────────
@@ -81,16 +82,17 @@ services:
     environment:
       # 容器内固定值，覆盖 .env 中的本地路径
       - REDIS_URL=redis://:${REDIS_PASSWORD:-echomind123}@redis:6379/0
-      - CHROMA_PERSIST_DIRECTORY=/app/data/chroma
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-echomind}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-echomind}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
+      - EMBEDDING_DIMENSION=${EMBEDDING_DIMENSION:-512}
       - EVAL_BASELINE_PATH=/app/data/eval/baseline.json
     volumes:
-      - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval
       - ./logs:/app/logs
     depends_on:
       redis:
         condition: service_healthy
-      chromadb:
+      postgres:
         condition: service_healthy
     restart: unless-stopped
     networks:
@@ -135,6 +137,6 @@ networks:
 # ── 数据卷 ──────────────────────────────────────────────────────────────────
 volumes:
   redis-data:
-  chromadb-data:
+  postgres-data:
   prometheus-data:
   nginx-logs:

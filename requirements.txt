@@ -11,7 +11,11 @@ python-multipart==0.0.12    # FastAPI 文件上传支持
 
 # ── 数据存储 ──────────────────────────────────────────────────────────────────
 redis==5.2.1
-chromadb==0.5.23           # 向量数据库（长期记忆）
+chromadb==0.5.23           # 旧业务模块迁移前仍需导入
+asyncpg==0.32.0           # PostgreSQL 异步驱动
+pgvector==0.5.1           # pgvector 类型注册
+sentence-transformers==6.2.0  # 本地 Embedding 模型
+PyJWT==2.15.1            # JWT 签发与校验
 
 # ── 监控 ──────────────────────────────────────────────────────────────────────
 prometheus-client==0.21.1
