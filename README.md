@@ -8,9 +8,10 @@ EchoMind 适用于员工制度咨询、IT 系统支持、财务报销查询等�
 
 - **任务规划与多 Agent 编排**：通过漏斗式领域分析识别简单、复杂及歧义请求；复杂问题由 LLM 拆分为带原文证据和依赖关系的任务，再由代码决定单路、并行、串行或澄清路径。
 - **领域分析与意图识别**：主对话链路采用关键词与本地 n-gram 的轻量领域分析，并在复杂场景升级到 LLM 多领域分析；独立意图识别组件支持 LLM Few-shot、规则匹配、可选 Embedding 相似度、实体提取、紧急度判断和低置信度回退。
-- **三级记忆**：Redis 保存会话工作记忆，ChromaDB 保存可检索的情景记忆与用户画像；长对话可被压缩为摘要。
+- **三级记忆**：Redis 保存会话工作记忆，PostgreSQL/pgvector 保存可检索的情景记忆与用户画像；长对话可被压缩为摘要。
 - **RAG 知识库**：支持文档切片、导入、查询改写、多子查询并行召回、去重与 LLM 重排。
 - **工具治理**：工具的 JSON Schema 校验、Agent 权限、缓存、超时、熔断与降级统一由工具管理器处理；`tools/` 支持按约定自动发现扩展工具。
+- **人工确认操作**：报销提交与本地权限申请经服务端预检、预览、JWT 身份确认、幂等键和统一执行器提交；操作预览、幂等记录与审计事件写入 PostgreSQL。
 - **评测与监控**：提供意图、RAG、记忆和端到端回答质量评测；Prometheus 指标、Z-score 异常检测与可选 Webhook 告警会反馈给路由逻辑。
 
 > `mcp/` 是项目内部的工具治理模块命名，当前实现为自研 LLM Tool Calling 框架，并非完整的标准 MCP（Model Context Protocol）Server/Client 实现。
@@ -75,7 +76,7 @@ EchoMind 适用于员工制度咨询、IT 系统支持、财务报销查询等�
 | --- | --- |
 | API 服务 | Python 3.12、FastAPI、Pydantic、Uvicorn |
 | 模型调用 | Anthropic Python SDK；可配置 Anthropic 兼容服务 |
-| 存储 | Redis、ChromaDB |
+| 存储 | Redis、PostgreSQL/pgvector；演示业务状态为进程内存储 |
 | 可观测性 | Prometheus、Z-score 异常检测、Webhook 告警 |
 | 部署 | Docker、Docker Compose、Nginx |
 
@@ -114,7 +115,7 @@ Nginx 监听 `80` 端口，应用容器也映射在 `8000` 端口；两者均可
 
 ### 方式二：本地开发
 
-**前置条件**：Python 3.12、Redis；建议启动 ChromaDB 服务（不可用时知识库会降级为本地持久化模式）。所有 Python 依赖均安装在项目虚拟环境中。
+**前置条件**：Python 3.12、Redis、已初始化 pgvector 扩展和表结构的 PostgreSQL。服务启动时必须连接 PostgreSQL；初始化脚本见 `config/postgres/init.sql`。所有 Python 依赖均安装在项目虚拟环境中。
 
 ```powershell
 # 创建并激活虚拟环境（首次使用时）
@@ -131,7 +132,7 @@ Copy-Item .env.example .env
 python -m uvicorn api.main:app --reload
 ```
 
-本地运行时，请将 `.env` 的 Redis 和 ChromaDB 地址改为本机实际地址；例如使用 Compose 单独启动依赖服务后，可将 `CHROMA_HOST=localhost`、`CHROMA_PORT=8001`。`CHROMA_PERSIST_DIRECTORY` 仅用于 ChromaDB 服务不可用时的本地回退。
+本地运行时，请将 `.env` 的 `REDIS_URL`、`DATABASE_URL` 和 `JWT_SECRET_KEY` 改为实际值。Compose 默认在本机映射 PostgreSQL 的 `5432` 端口；首次创建数据卷时执行初始化 SQL。修改 `EMBEDDING_DIMENSION` 时须同步迁移数据库中的向量列。
 
 也可以运行交互式命令行：
 
@@ -150,7 +151,10 @@ python api/main.py --cli
 | `ANTHROPIC_MODEL` | 模型名称，可选 | `claude-3-5-sonnet-20241022` |
 | `REDIS_URL` | Redis 连接地址 | `redis://localhost:6379/0` |
 | `REDIS_PASSWORD` | Redis 密码 | 本地开发请按实际 Redis 配置填写 |
-| `CHROMA_HOST` / `CHROMA_PORT` | ChromaDB 服务地址 | 本地 Compose 映射端口为 `localhost:8001` |
+| `DATABASE_URL` / `DATABASE_URL_DOCKER` | 本地 / Compose 内 PostgreSQL 连接地址 | `localhost:5432` / `postgres:5432` |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSION` | 显式 Embedding 模型与向量维度 | `BAAI/bge-small-zh-v1.5` / `512` |
+| `JWT_SECRET_KEY` | 操作接口的 HS256 JWT 签名密钥 | 必须替换示例值 |
+| `APP_ENV` | 仅 `development` 时开放本地演示令牌接口 | `production` |
 | `MAX_TOOL_ROUNDS` | 单次 Agent 请求的最大工具调用轮数 | `5` |
 | `PROMETHEUS_PORT` | 应用额外暴露 Prometheus HTTP 服务的端口；设 `0` 关闭 | `9091` |
 | `EVAL_BASELINE_PATH` | 评测基线文件路径 | `./data/eval/baseline.json` |
@@ -194,6 +198,10 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/knowledge/upload -Form
 | --- | --- | --- |
 | `GET` | `/health` | 服务状态与 Agent 统计 |
 | `POST` | `/chat` | 主对话链路 |
+| `POST` | `/auth/dev-token` | 仅开发环境签发本地演示 JWT |
+| `POST` | `/access-requests/prepare` | JWT 认证后预检并创建本地权限申请预览 |
+| `GET` | `/operations/{operation_id}` | JWT 认证后读取本人预览 |
+| `POST` | `/operations/{operation_id}/confirm` | JWT + `Idempotency-Key` 确认并执行预览 |
 | `POST` | `/search?query=...&top_k=5` | RAG 检索优化链路 |
 | `POST` | `/knowledge/add` | 批量导入 JSON 文档 |
 | `POST` | `/knowledge/upload` | 上传 `.txt`、`.md` 或 JSON 文档数组 |
@@ -207,6 +215,12 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/knowledge/upload -Form
 在 `tools/` 目录新增以 `_tool.py` 结尾的模块即可被自动发现。模块需提供 `build_tools()`，返回一个或多个 `Tool`；同时指定参数 Schema 与可调用 Agent。详细约定见 [`tools/README.md`](tools/README.md)。
 
 当前 `billing_lookup` 和 `fault_diagnose` 是用于演示工具调用链路的模拟工具，不连接真实财务、工单或企业系统。
+
+### 人工确认与业务数据边界
+
+`/chat` 仍接受请求体中的 `user_id`，没有 Bearer 身份验证，只适合演示对话。报销对话可以生成 `pending_operation`，但实际提交必须由相同员工的 JWT 调用 `/operations/{operation_id}/confirm`，并提供非空 `Idempotency-Key`。权限申请使用已认证的 `/access-requests/prepare` 创建预览。确认时执行器再次预检资源版本与预览快照；相同幂等键可重放结果，冲突或过期预览会被拒绝。提交工具只接受执行器授权的调用。
+
+正常应用生命周期使用 PostgreSQL 保存操作预览、确认状态、幂等响应和审计事件；报销单和权限申请工单仍在进程内存储，重启会丢失。权限申请不会调用外部 IAM，报销流程不会调用外部财务系统，因此这些示例不构成持久业务数据或生产级身份集成。
 
 ## 测试与评测
 
@@ -226,14 +240,14 @@ EchoMind/
 ├── agents/agent_orchestrator.py   # 多 Agent 执行、串并行、降级与统计
 ├── core/intent_recognizer.py      # 漏斗、领域分析、独立意图/实体/紧急度识别
 ├── core/task_planner.py            # LLM 任务草案校验与执行模式决策
-├── memory/conversation_memory.py  # Redis + ChromaDB 三级记忆
-├── mcp/knowledge_base.py          # 文档切片与 ChromaDB RAG 检索
+├── memory/conversation_memory.py  # Redis + PostgreSQL/pgvector 三级记忆
+├── mcp/knowledge_base.py          # 文档切片与 pgvector RAG 检索
 ├── mcp/tool_manager.py            # 工具治理、检索优化与调用链路
 ├── tools/                         # 可自动发现的扩展工具
 ├── evaluation/                    # 评测器、基准脚本与匿名化材料
 ├── monitor/performance_monitor.py # 指标、异常检测与路由反馈
 ├── tests/                         # 单元测试
-└── docker-compose.yml             # Redis、ChromaDB、Prometheus、Nginx 与应用编排
+└── docker-compose.yml             # Redis、PostgreSQL、Prometheus、Nginx 与应用编排
 ```
 
 ## 许可证与使用边界

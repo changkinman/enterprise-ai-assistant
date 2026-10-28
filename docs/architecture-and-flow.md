@@ -26,14 +26,16 @@ FastAPI（api/main.py）
   ├── /chat                 主对话入口
   ├── /search               知识检索
   ├── /knowledge*           知识写入与上传
-  ├── /evaluation/run       评测执行
-  └── /monitor/summary、/metrics
+  ├── /eval/run             评测执行
+  ├── /access-requests/prepare、/operations/{id}、/operations/{id}/confirm
+  └── /monitor、/metrics
   │
   ├── IntentRecognizer      意图、实体、紧急度识别
   ├── MemoryManager         工作记忆、情景记忆、用户画像
   ├── AgentOrchestrator     领域路由、并行协作、结果汇总
   ├── MCPToolManager        工具调用治理与检索优化
   ├── KnowledgeBase         文档切片、向量检索
+  ├── SideEffectExecutor    操作预检、预览、确认、幂等和审计
   ├── EndToEndEvaluator     离线/在线评测
   └── PerformanceMonitor    指标、异常、路由惩罚
           │                    │
@@ -41,10 +43,12 @@ FastAPI（api/main.py）
   Anthropic 兼容 LLM API    Prometheus
           │
           ├── Redis（会话工作记忆）
-          └── PostgreSQL + pgvector（情景记忆、画像、知识库）
+          └── PostgreSQL + pgvector（情景记忆、画像、知识库、操作记录）
 ```
 
 `api/main.py` 是应用装配点。FastAPI 生命周期启动时连接一次 PostgreSQL，构造显式 Embedding provider 与共享 VectorStore，并注入记忆管理器和知识库；HTTP 路由复用这些已初始化的组件处理请求。关闭时释放数据库连接池。
+
+正常生命周期同时注入 `PostgresOperationRepository`。操作预览、确认状态、幂等响应和审计事件持久化在 PostgreSQL；报销单与权限申请工单使用进程内仓库，重启后丢失，不代表持久业务数据。权限申请未连接外部 IAM。
 
 模型调用使用 `anthropic.AsyncAnthropic` 的异步客户端。通过设置 `ANTHROPIC_BASE_URL` 可将请求指向 Anthropic 兼容的第三方接口（例如 DeepSeek 的 Anthropic 兼容端点）；因此 SDK 名称并不等同于实际使用 Claude 模型。
 
@@ -58,6 +62,7 @@ FastAPI（api/main.py）
 | 记忆 | `memory/conversation_memory.py` | 管理短期会话、跨会话历史与长期画像；长对话摘要压缩 | Redis、VectorStore、LLM |
 | 工具治理 | `mcp/tool_manager.py` | 工具注册和 Agent 授权；参数校验、缓存、超时、熔断、降级；检索查询改写和重排 | LLM、KnowledgeBase |
 | 知识库 | `mcp/knowledge_base.py` | 文档切片、向量写入、检索 | VectorStore、显式 Embedding provider |
+| 人工确认操作 | `core/side_effect_executor.py` | 预检、预览、确认时重验、幂等与审计 | JWT、PostgresOperationRepository、业务适配器 |
 | 评测 | `evaluation/evaluator.py` | 意图 Accuracy/F1、LLM-as-Judge、端到端多轮和基线回归评测 | 编排器、识别器、LLM |
 | 监控 | `monitor/performance_monitor.py` | Prometheus 指标、Z-score 异常检测、告警和路由惩罚反馈 | 编排器、Prometheus |
 
@@ -130,7 +135,7 @@ LLM 与 Embedding 分支可并行运行。为兼容第三方 Anthropic API，当
 
 ```text
 制度/流程/操作规范文档
-  → /knowledge 或 /knowledge/upload
+  → /knowledge/add 或 /knowledge/upload
   → 文本抽取与切片
   → 显式 Embedding provider 生成向量并写入 PostgreSQL + pgvector
   → 保留可检索的内容及元数据
@@ -181,17 +186,25 @@ Agent 请求工具
 | --- | --- |
 | `GET /health` | 服务健康检查 |
 | `POST /chat` | 主对话入口 |
+| `POST /auth/dev-token` | 仅 `APP_ENV=development` 签发本地演示 JWT |
+| `POST /access-requests/prepare` | JWT 认证后预检并预览本地权限申请 |
+| `GET /operations/{operation_id}` | JWT 认证后读取本人预览 |
+| `POST /operations/{operation_id}/confirm` | JWT + `Idempotency-Key` 确认操作 |
 | `GET /search` | 知识库检索 |
-| `POST /knowledge` | 写入知识文档 |
+| `POST /knowledge/add` | 写入知识文档 |
 | `POST /knowledge/upload` | 上传并写入知识文档 |
-| `POST /evaluation/run` | 运行评测 |
-| `GET /monitor/summary` | 获取监控摘要 |
+| `POST /eval/run` | 运行评测 |
+| `GET /monitor` | 获取监控摘要 |
 | `GET /metrics` | 暴露 Prometheus 指标 |
+
+### 8.1 人工确认操作
+
+报销对话可以返回 `pending_operation`，权限申请使用已认证的 `/access-requests/prepare` 产生预览。`/chat` 仍以请求体 `user_id` 标识用户且无 Bearer 鉴权，只适合演示对话；自然语言确认不能代替操作 API 的认证。客户端读取预览后，以同一所有者的 JWT 和非空 `Idempotency-Key` 调用确认接口。统一执行器在确认时锁定待处理操作，核对到期时间、资源版本与快照，再由适配器执行一次业务写入；相同幂等键返回已有响应，冲突、失效和失败写入操作审计。报销提交工具要求执行器授权，不能由普通 Agent 工具调用直接提交。开发环境令牌接口仅供本地演示，未实现外部身份系统集成。
 
 ## 9. 部署与维护要点
 
 - 推荐通过 Docker Compose 同时启动 EchoMind、Redis、PostgreSQL + pgvector、Prometheus 和 Nginx。
 - 请求路径应保持异步：API、模型调用、工具调用与记忆操作均优先使用 `async` / `await`，避免阻塞 FastAPI 事件循环。
 - 变更 Agent、工具或评测数据结构时，同时检查 API 响应序列化、监控统计以及测试覆盖。
-- 核心行为的测试重点包括工具错误、超时和熔断、路由降级及数据序列化。当前测试位于 `tests/test_agent_tools.py`。
+- 核心行为的测试重点包括工具错误、超时和熔断、路由降级、数据序列化及操作确认。测试分布在 `tests/` 中的多个模块。
 - 本项目当前可准确描述为：多 Agent、RAG、LLM Tool Calling、Redis + PostgreSQL/pgvector 三级记忆、LLM-as-Judge、Prometheus 监控和 Docker Compose 部署。不要将其表述为已实现标准 MCP 协议、真实动态学习的意图权重、Grafana 可视化或外部业务系统集成，除非对应能力后续实际完成并验证。
