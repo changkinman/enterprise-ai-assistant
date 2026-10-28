@@ -21,7 +21,7 @@ if _ROOT not in sys.path:
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, UploadFile, File
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
@@ -288,11 +288,15 @@ async def _operation_not_found_or_forbidden(executor, operation_id: str, actor) 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
 @app.post("/auth/dev-token")
-async def issue_dev_token(body: DevTokenInput):
+async def issue_dev_token(request: Request):
     from core.auth import Actor, AuthenticationError, create_dev_access_token
 
     if os.environ.get("APP_ENV") != "development":
         raise HTTPException(404, "Not found")
+    try:
+        body = DevTokenInput.model_validate(await request.json())
+    except ValueError as exc:
+        raise HTTPException(422, "Invalid actor") from exc
     if not body.actor_id.strip() or body.role not in {"employee", "manager"}:
         raise HTTPException(422, "Invalid actor")
     try:

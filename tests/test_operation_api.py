@@ -125,3 +125,16 @@ class OperationApiTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"APP_ENV": "production"}):
             hidden = await self.call("POST", "/auth/dev-token", json={"actor_id": "emp-001", "role": "employee"})
         self.assertEqual(hidden.status_code, 404)
+
+    async def test_dev_token_is_hidden_before_body_validation_outside_development(self):
+        with patch.dict(os.environ, {"APP_ENV": "production"}):
+            for kwargs in ({}, {"json": {}}, {"content": "not-json",
+                                      "headers": {"Content-Type": "application/json"}}):
+                with self.subTest(kwargs=kwargs):
+                    response = await self.call("POST", "/auth/dev-token", **kwargs)
+                    self.assertEqual(response.status_code, 404)
+
+    async def test_dev_token_still_validates_body_in_development(self):
+        self.assertEqual((await self.call("POST", "/auth/dev-token", json={})).status_code, 422)
+        self.assertEqual((await self.call("POST", "/auth/dev-token", content="not-json",
+                                      headers={"Content-Type": "application/json"})).status_code, 422)
