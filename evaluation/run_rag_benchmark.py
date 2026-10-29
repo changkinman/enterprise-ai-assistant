@@ -1,8 +1,8 @@
 """RAG 检索基准：原始向量召回 vs 查询改写、多路召回和 LLM 重排。
 
-该脚本在含 ChromaDB Python 客户端与模型配置的环境中运行，默认读取
-evaluation/fixtures/rag_documents.json 与 rag_cases.json。每次运行都使用独立的
-临时 collection，结束后删除，不会写入项目正式知识库。
+旧版脚本创建临时 Chroma collection。运行时检索已迁移到 PostgreSQL/pgvector，
+因此本入口保留为明确的迁移提示；隔离数据库由评测环境负责提供，脚本不会
+隐式创建服务。
 """
 import asyncio
 import json
@@ -14,7 +14,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import chromadb
 from anthropic import AsyncAnthropic
 
 
@@ -189,11 +188,10 @@ class RagBenchmark:
 
 
 async def main() -> None:
-    benchmark = RagBenchmark()
-    try:
-        print(json.dumps(await benchmark.run(), ensure_ascii=False), flush=True)
-    finally:
-        benchmark.cleanup()
+    raise RuntimeError(
+        "RAG benchmark needs an isolated PostgreSQL/pgvector environment; "
+        "the legacy Chroma benchmark is retired."
+    )
 
 
 if __name__ == "__main__":

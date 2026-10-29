@@ -114,9 +114,17 @@ def build_tools(repository: InMemoryReimbursementRepository) -> list[Tool]:
             raise ValueError("请先由用户确认提交报销单")
         if not context.get("user_id") or not context.get("conv_id"):
             raise ValueError("缺少可信用户或会话上下文")
+        expected_case_version = context.get("expected_case_version")
+        expected_material_version = context.get("expected_material_version")
+        if (not isinstance(expected_case_version, int) or isinstance(expected_case_version, bool)
+                or not isinstance(expected_material_version, int)
+                or isinstance(expected_material_version, bool)):
+            raise ValueError("缺少报销单预览版本")
         return await repository.submit_claim(
             params["case_id"], params["idempotency_key"],
             context["user_id"], context["conv_id"], _validate,
+            expected_case_version=expected_case_version,
+            expected_material_version=expected_material_version,
         )
 
     async def review_claim(params, context):
@@ -146,5 +154,6 @@ def build_tools(repository: InMemoryReimbursementRepository) -> list[Tool]:
     return [Tool(name=name, description=f"企业演示报销流程：{name}", handler=handler,
                  schema={"type": "object", "properties": {key: {"type": kind} for key, kind in fields.items()},
                          "required": required, "additionalProperties": False},
-                 cache_ttl=ttl, allowed_agents=frozenset({"billing"}))
+                 cache_ttl=ttl, allowed_agents=frozenset({"billing"}),
+                 executor_only=name == "submit_claim")
             for name, (handler, fields, required, ttl) in handlers.items()]

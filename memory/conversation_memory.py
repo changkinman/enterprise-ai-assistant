@@ -3,26 +3,24 @@
 
 三级记忆架构，模拟人类记忆机制：
   1. 工作记忆（Redis）—— 当前会话的最近 N 条消息，毫秒级读写
-  2. 情景记忆（ChromaDB）—— 跨会话的历史对话，按语义相似度检索
-  3. 用户画像（ChromaDB）—— 从对话中提炼的长期偏好和实体
+  2. 情景记忆（PostgreSQL + pgvector）—— 跨会话的历史对话，按语义相似度检索
+  3. 用户画像（PostgreSQL）—— 从对话中提炼的长期偏好和实体
 
 关键设计：
   - 上下文构建时三级记忆融合，按重要性 + 时效性排序
   - 工作记忆超过阈值时自动压缩（LLM 摘要），防止 context 爆炸
-  - 所有 Embedding 通过 Anthropic API 生成，无本地模型
+  - 情景记忆 Embedding 由 VectorStore 的显式 provider 生成
 """
-import hashlib
 import json
 import logging
-import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-import chromadb
 import redis
 from anthropic import AsyncAnthropic
+from core.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +72,7 @@ class MemoryManager:
     """
     三级记忆管理器。
 
-    工作记忆存 Redis（TTL 24h），情景记忆和用户画像存 ChromaDB（持久化）。
+    工作记忆存 Redis（TTL 24h），情景记忆和用户画像存 PostgreSQL（持久化）。
     """
 
     WORKING_MAX   = 20    # 工作记忆最大条数，超过则触发压缩
@@ -83,10 +81,8 @@ class MemoryManager:
 
     def __init__(
         self,
+        vector_store: VectorStore,
         redis_url:    str = "redis://localhost:6379/0",
-        chroma_host:  str = "localhost",
-        chroma_port:  int = 8000,
-        chroma_path:  str = "./data/chroma",
         api_key:      str = "",
         base_url:     Optional[str] = None,
         model:        str = "claude-3-5-sonnet-20241022",
@@ -98,23 +94,7 @@ class MemoryManager:
         self._model  = model
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
-
-        # ChromaDB：优先连接独立服务（docker compose 模式），连不上则降级为本地嵌入式
-        try:
-            chroma = chromadb.HttpClient(host=chroma_host, port=chroma_port)
-            chroma.heartbeat()  # 测试连接
-            logger.info(f"ChromaDB 已连接: {chroma_host}:{chroma_port}")
-        except Exception:
-            logger.info(f"ChromaDB 服务不可用，使用本地嵌入式模式: {chroma_path}")
-            chroma = chromadb.PersistentClient(
-                path=chroma_path,
-                settings=chromadb.Settings(anonymized_telemetry=False),
-            )
-
-        # 情景记忆：存储历史对话片段
-        self._episodic = chroma.get_or_create_collection("episodic")
-        # 用户画像：存储提炼出的偏好和实体
-        self._profile  = chroma.get_or_create_collection("user_profile")
+        self._vector_store = vector_store
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
 
@@ -152,7 +132,7 @@ class MemoryManager:
     async def update_profile(self, user_id: str, conv_id: str) -> None:
         """
         从当前工作记忆中提炼用户偏好，更新用户画像。
-        用 LLM 提炼偏好，然后存入 ChromaDB（ChromaDB 内置 embedding，不依赖外部 API）。
+        用 LLM 提炼偏好，然后存入 PostgreSQL。
         """
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
@@ -181,21 +161,7 @@ class MemoryManager:
             s, e = raw.find("{"), raw.rfind("}") + 1
             profile_data = json.loads(raw[s:e])
 
-            doc_id = f"{user_id}_profile_{conv_id}"
-            doc_text = self._safe_text(json.dumps(profile_data, ensure_ascii=False))
-
-            try:
-                self._profile.delete(ids=[doc_id])
-            except Exception:
-                pass
-
-            # 直接传 documents，让 ChromaDB 内置模型生成 embedding（不依赖 Voyage API）
-            self._profile.add(
-                ids=[doc_id],
-                documents=[doc_text],
-                metadatas=[{"user_id": user_id, "conv_id": conv_id,
-                            "ts": datetime.now().isoformat()}],
-            )
+            await self._vector_store.upsert_profile(user_id, profile_data)
             logger.info(f"用户画像已更新: {user_id}")
         except Exception as ex:
             logger.warning(f"更新用户画像失败: {ex}")
@@ -266,7 +232,7 @@ class MemoryManager:
         工作记忆压缩：
           1. 用 LLM 对旧消息生成摘要
           2. 摘要存 Redis（覆盖旧摘要）
-          3. 旧消息存入情景记忆（ChromaDB）供跨会话检索
+          3. 旧消息存入情景记忆供跨会话检索
           4. 工作记忆只保留最近 5 条
         """
         messages = await self._get_working_memory(user_id, conv_id)
@@ -329,47 +295,34 @@ class MemoryManager:
         return msgs
 
     async def _search_episodic(self, user_id: str, query: str) -> List[str]:
-        """语义检索情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
+        """语义检索情景记忆。"""
         query_text = self._safe_text(query).strip()
         if not query_text:
             return []
         try:
-            # 直接传 query_texts，ChromaDB 内置模型自动生成向量做匹配
-            results = self._episodic.query(
-                query_texts=[query_text],
-                n_results=self.HISTORY_TOP_K,
-                where={"user_id": self._safe_text(user_id)},
+            docs = await self._vector_store.search_episodic(
+                self._safe_text(user_id), query_text, self.HISTORY_TOP_K,
             )
-            docs = results["documents"][0] if results["documents"] else []
             return [self._safe_text(doc) for doc in docs if isinstance(doc, str) and doc.strip()]
         except Exception as ex:
             logger.warning(f"情景记忆检索失败: {ex}")
             return []
 
     async def _store_episodic(self, user_id: str, conv_id: str, text: str, summary: str) -> None:
-        """将压缩后的对话片段存入情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
+        """将压缩后的对话片段存入情景记忆。"""
         try:
             user_id = self._safe_text(user_id)
             conv_id = self._safe_text(conv_id)
             text = self._safe_text(text)
             summary = self._safe_text(summary)
-            doc_id = hashlib.md5(f"{user_id}{conv_id}{time.time()}".encode()).hexdigest()
-            # 直接传 documents，ChromaDB 内置模型自动生成 embedding
-            self._episodic.add(
-                ids=[doc_id],
-                documents=[summary],
-                metadatas=[{"user_id": user_id, "conv_id": conv_id,
-                            "ts": datetime.now().isoformat(), "full_text": self._safe_text(text[:500])}],
-            )
+            await self._vector_store.store_episodic(user_id, conv_id, text, summary)
         except Exception as ex:
             logger.warning(f"存储情景记忆失败: {ex}")
 
     async def _get_profile(self, user_id: str) -> Dict[str, Any]:
         """获取用户画像（取最新一条）。"""
         try:
-            results = self._profile.get(where={"user_id": user_id}, limit=1)
-            if results["documents"]:
-                return json.loads(results["documents"][0])
+            return await self._vector_store.get_profile(user_id)
         except Exception:
             pass
         return {}
@@ -388,7 +341,7 @@ class MemoryManager:
 
     @staticmethod
     def _safe_text(value: Any) -> str:
-        """转成 ChromaDB 可接受的普通 UTF-8 字符串。"""
+        """转成可安全持久化的普通 UTF-8 字符串。"""
         if value is None:
             return ""
         if not isinstance(value, str):
@@ -397,7 +350,7 @@ class MemoryManager:
 
     @classmethod
     def _safe_metadata_value(cls, value: Any) -> Any:
-        """递归清洗 metadata，避免 Redis/ChromaDB 后续读写遇到非法 UTF-8。"""
+        """递归清洗 metadata，避免后续读写遇到非法 UTF-8。"""
         if isinstance(value, str):
             return cls._safe_text(value)
         if isinstance(value, dict):

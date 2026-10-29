@@ -30,6 +30,8 @@ except ModuleNotFoundError:
     ChatResponse = ToolCallResponse = None
 from mcp.tool_manager import MCPToolManager, Tool
 from tools.loader import discover_agent_tools
+from tools.reimbursement_tool import build_tools as build_reimbursement_tools
+from core.reimbursement_repository import InMemoryReimbursementRepository
 
 
 class FakeMessages:
@@ -56,6 +58,49 @@ def manager_with_tools():
 
 
 class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_submit_claim_registration_is_executor_only(self):
+        manager = MCPToolManager(api_key="test-key")
+        for tool in build_reimbursement_tools(InMemoryReimbursementRepository()):
+            manager.register(tool)
+        self.assertNotIn("submit_claim", [tool["name"] for tool in manager.anthropic_tools_for_agent("billing")])
+        denied = await manager.call(
+            "submit_claim", {"case_id": "missing", "idempotency_key": "k1"},
+            {"user_id": "emp-001", "conv_id": "conv-1", "confirmed": True},
+            caller_agent="billing",
+        )
+        self.assertFalse(denied.success)
+        self.assertIn("执行器", denied.error)
+
+    async def test_executor_only_tool_is_hidden_and_requires_explicit_authorization(self):
+        calls = []
+
+        async def write(params, context):
+            calls.append(params["value"])
+            return {"written": params["value"]}
+
+        manager = MCPToolManager(api_key="test-key")
+        manager.register(Tool(
+            "private_write", "write", write,
+            {"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]},
+            allowed_agents=frozenset({"billing"}), executor_only=True,
+        ))
+        self.assertNotIn("private_write", [tool["name"] for tool in manager.anthropic_tools_for_agent("billing")])
+        denied = await manager.call("private_write", {"value": "x"}, caller_agent="billing")
+        self.assertFalse(denied.success)
+        self.assertEqual(calls, [])
+        missing_agent = await manager.call(
+            "private_write", {"value": "x"}, executor_authorized=True,
+        )
+        self.assertFalse(missing_agent.success)
+        self.assertEqual(calls, [])
+        allowed = await manager.call(
+            "private_write", {"value": "x"}, caller_agent="billing", executor_authorized=True,
+            use_cache=False,
+        )
+        self.assertTrue(allowed.success)
+        self.assertEqual(allowed.data, {"written": "x"})
+        self.assertEqual(calls, ["x"])
+
     async def test_rerank_empty_order_falls_back_to_retrieval_order(self):
         manager = MCPToolManager(api_key="test-key")
         manager._client = FakeClient([[SimpleNamespace(text="[]")]])

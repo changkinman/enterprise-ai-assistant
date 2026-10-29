@@ -117,6 +117,7 @@ class Tool:
     fallback:    Optional[Callable] = None    # sync/async (params, context, error) -> Any
     allowed_agents: frozenset[str] = field(default_factory=frozenset)
     # 空集合表示仅供系统内部直接调用，不向任何 Agent 暴露。
+    executor_only: bool = False
 
     # 运行时状态（不参与构造）
     stats:   ToolStats    = field(default_factory=ToolStats, init=False)
@@ -167,7 +168,7 @@ class MCPToolManager:
                 "description": tool.description,
                 "input_schema": tool.schema,
             }
-            for tool in self.get_tools_for_agent(agent_type)
+            for tool in self.get_tools_for_agent(agent_type) if not tool.executor_only
         ]
 
     # ── 核心调用 ──────────────────────────────────────────────────────────────
@@ -181,6 +182,7 @@ class MCPToolManager:
         use_cache: bool = True,
         rerank_top_k: int = 0,          # >0 时对结果重排，取 Top-K
         caller_agent: Optional[Any] = None,
+        executor_authorized: bool = False,
     ) -> ToolResult:
         """
         调用工具，完整执行链：
@@ -189,6 +191,10 @@ class MCPToolManager:
         tool = self._tools.get(name)
         if not tool:
             return ToolResult(success=False, data=None, tool_name=name, error=f"工具不存在: {name}")
+
+        if tool.executor_only and (not executor_authorized or caller_agent is None):
+            return ToolResult(success=False, data=None, tool_name=name,
+                              error=f"工具仅允许具有 Agent 身份的执行器调用: {name}")
 
         if caller_agent is not None:
             agent_name = self._agent_name(caller_agent)

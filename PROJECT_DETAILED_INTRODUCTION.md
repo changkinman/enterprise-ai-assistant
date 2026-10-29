@@ -6,7 +6,7 @@
 
 EchoMind 是一个面向企业内部服务场景的异步智能助手。它处理制度与流程咨询、IT 故障支持、费用报销等自然语言请求，并将意图分析、对话记忆、知识检索、领域 Agent、工具调用、监控和评测组合为可观测的服务链路。
 
-系统的目标不是直接替代财务、工单或身份系统，而是在员工与这些分散知识、流程之间提供可追溯的自助服务入口。当前部分扩展工具是模拟实现；接入真实业务系统前仍需补充鉴权、审计、权限和数据脱敏能力。
+系统为知识咨询和受控操作提供自助入口。当前 JWT 只保护操作预览与确认接口，`/chat` 的 `user_id` 仍由请求体提供，适合演示；报销与权限申请的业务数据仍在进程内，未接入外部财务系统或 IAM。操作预览、幂等记录和审计事件由 PostgreSQL 保存；真实企业接入还需完善身份体系、访问控制、数据治理与脱敏。
 
 ## 2. 技术架构与模块边界
 
@@ -17,15 +17,16 @@ EchoMind 是一个面向企业内部服务场景的异步智能助手。它处�
 FastAPI（api/main.py）
   │
   ├─ MemoryManager ─────────── Redis：工作记忆、摘要、澄清状态
-  │         └──────────────── ChromaDB：情景记忆、用户画像
+  │         └──────────────── PostgreSQL/pgvector：情景记忆、用户画像
   │
-  ├─ MCPToolManager ────────── KnowledgeBase（ChromaDB）
+  ├─ MCPToolManager ────────── KnowledgeBase（PostgreSQL/pgvector）
   │         └──────────────── 工具：权限、校验、缓存、超时、熔断、降级
   │
   ├─ AgentOrchestrator
   │     ├─ IntentRecognizer：漏斗、领域分析、意图识别
   │     ├─ TaskPlanner：任务拆分校验与执行模式决策
   │     └─ General / Technical / Billing Agent
+  ├─ SideEffectExecutor ──── 预检、预览、JWT 确认、幂等与审计
   │
   ├─ EndToEndEvaluator：离线与回归评测
   └─ PerformanceMonitor：Prometheus、异常检测、路由反馈
@@ -40,8 +41,9 @@ FastAPI（api/main.py）
 | 意图与领域分析 | `core/intent_recognizer.py` | 精确寒暄漏斗、轻量领域评分、LLM 多领域候选、传统意图识别 | LLM、本地字符 n-gram |
 | 任务规划 | `core/task_planner.py` | LLM 任务草案、证据与依赖校验、单路/并行/串行/澄清决策 | LLM、领域候选 |
 | Agent 编排 | `agents/agent_orchestrator.py` | Agent 选择、工具调用循环、失败降级、结果聚合 | 意图分析、任务规划、工具管理器 |
-| 对话记忆 | `memory/conversation_memory.py` | 工作记忆、跨会话情景记忆、用户画像、摘要压缩 | Redis、ChromaDB、LLM |
-| 知识检索 | `mcp/knowledge_base.py` | 文档切分、入库、向量检索 | ChromaDB |
+| 对话记忆 | `memory/conversation_memory.py` | 工作记忆、跨会话情景记忆、用户画像、摘要压缩 | Redis、PostgreSQL/pgvector、LLM |
+| 知识检索 | `mcp/knowledge_base.py` | 文档切分、入库、向量检索 | PostgreSQL/pgvector |
+| 人工确认 | `core/side_effect_executor.py` | 预检、预览、确认、幂等及审计 | JWT、PostgresOperationRepository、操作适配器 |
 | 工具治理 | `mcp/tool_manager.py` | 工具注册、权限、Schema 校验、缓存、超时、熔断、检索优化 | LLM、工具 Handler |
 | 在线监控 | `monitor/performance_monitor.py` | 统计收集、阈值和 Z-score 异常、告警、路由惩罚 | Prometheus、编排器、工具管理器 |
 | 评测 | `evaluation/evaluator.py` | 意图 Accuracy/F1、LLM-as-Judge、多轮对话、回归比较 | 编排器、识别器、LLM |
@@ -51,11 +53,11 @@ FastAPI（api/main.py）
 FastAPI 使用 `lifespan` 在进程启动时装配单例组件，而不是在每个请求中重新建立客户端：
 
 1. 从 `.env` 读取模型配置。`ANTHROPIC_API_KEY` 是必需项；`ANTHROPIC_BASE_URL` 非空时，Anthropic SDK 会请求兼容接口，实际模型不一定是 Claude。
-2. 创建 `MemoryManager`，优先连接 Redis 与独立 ChromaDB 服务；ChromaDB 不可用时使用本地持久化 Client 回退。
+2. 连接 PostgreSQL 并构造显式 Embedding provider 与共享 VectorStore；创建使用 Redis 工作记忆和 PostgreSQL/pgvector 情景记忆、画像的 `MemoryManager`。数据库连接失败会阻止启动，没有 ChromaDB 本地回退。
 3. 创建 `MCPToolManager` 和 `KnowledgeBase`，注册 `knowledge_search`，再通过 `tools.loader.discover_agent_tools()` 发现扩展工具。
-4. 在工具目录完整后创建 `AgentOrchestrator`，让各 Agent 获得已授权工具定义。
+4. 创建 PostgreSQL 操作仓库、`SideEffectExecutor`、报销与权限申请适配器，再创建 `AgentOrchestrator`，让各 Agent 获得已授权工具定义。
 5. 创建并启动 `PerformanceMonitor`，然后创建 `EndToEndEvaluator`。
-6. 关闭服务时停止监控后台任务。
+6. 关闭服务时停止监控后台任务并关闭 PostgreSQL 连接池。
 
 `knowledge_search` 被注册为受治理工具：它有 JSON Schema、300 秒缓存、可重排标记和失败降级结果。Agent 不能绕过 `MCPToolManager.call()` 直接调用 Handler。
 
@@ -228,12 +230,12 @@ routing_score = (成功率 × 0.7 + 延迟得分 × 0.3) × (1 - 监控惩罚)
 
 ### 7.1 写入与集合
 
-`KnowledgeBase` 使用 ChromaDB 的 `knowledge_base` collection。知识文档通过 `/knowledge/add` 或 `/knowledge/upload` 写入：
+`KnowledgeBase` 使用共享 `VectorStore` 与 PostgreSQL/pgvector。知识文档通过 `/knowledge/add` 或 `/knowledge/upload` 写入：
 
 1. `.txt`、`.md` 或 JSON 文档被读取；上传大小限制为 10MB；
 2. 长文本按句号/换行切分为最多约 500 字的片段；
-3. 每个片段以标题、分片序号和总片数作为 metadata 写入 ChromaDB；
-4. ChromaDB 内置 `all-MiniLM-L6-v2` Embedding 完成向量化。
+3. 每个片段以标题、分片序号和总片数作为 metadata 写入 PostgreSQL；
+4. 显式 `SentenceTransformerEmbeddingProvider` 按 `EMBEDDING_MODEL` 生成向量；默认维度为 512，与初始化表结构对应。
 
 普通 `search()` 返回标题、片段内容、由距离转换而来的相似度和分片序号。
 
@@ -254,7 +256,7 @@ routing_score = (成功率 × 0.7 + 延迟得分 × 0.3) × (1 - 监控惩罚)
 
 该链路的代价是额外 LLM 调用。是否使用增强检索应结合质量、时延和成本评估；仓库中的离线基准是开发回归材料，不代表生产流量表现。
 
-## 8. Redis 与 ChromaDB 三级对话记忆
+## 8. Redis 与 PostgreSQL/pgvector 三级对话记忆
 
 ### 8.1 工作记忆：Redis
 
@@ -284,16 +286,16 @@ wm:{user_id}:{conv_id}
 
 因此首次达到 15 条时压缩约 10 条，之后每新增约 10 条再次压缩。摘要 LLM 失败时仍会写入“摘要生成失败”的占位文本，保证工作记忆可收缩。
 
-### 8.3 情景记忆与画像：ChromaDB
+### 8.3 情景记忆与画像：PostgreSQL/pgvector
 
-| Collection | 写入内容 | 检索方式 |
+| 数据类别 | 写入内容 | 检索方式 |
 | --- | --- | --- |
-| `episodic` | 旧对话的摘要；metadata 包含 `user_id`、`conv_id`、时间和前 500 字原文 | 当前 query 的向量检索，按 `user_id` 过滤，Top-5 |
-| `user_profile` | LLM 提炼的 `preferences` 与部门、地点、常用业务等实体 JSON | 按 `user_id` 读取一条记录 |
+| `episodic_memories` | 旧对话摘要、全文、`user_id`、`conv_id`、向量和时间 | 当前 query 的向量检索，按 `user_id` 过滤 |
+| `user_profiles` | LLM 提炼的 `preferences` 与部门、地点、常用业务等实体 JSON | 按 `user_id` 读取一条记录 |
 
 用户画像更新取当前会话最近 10 条消息，并要求 LLM 只保留对后续企业服务有长期价值的信息。情景记忆的查询结果会以“相关历史”形式放入 Prompt。
 
-当前实现已有两个需要关注的边界：情景记忆没有时间衰减或相关度阈值，同一用户相似但实际无关的历史可能被召回；长期 collection 也没有自动保留期或归档策略。
+当前实现已有两个需要关注的边界：情景记忆没有时间衰减或相关度阈值，同一用户相似但实际无关的历史可能被召回；长期数据也没有自动保留期或归档策略。
 
 ## 9. 监控、评测与反馈闭环
 
@@ -327,6 +329,10 @@ Judge 的默认及格线为综合得分 0.75。由于 LLM Judge 本身可能与�
 | --- | --- | --- |
 | `GET` | `/health` | 返回服务状态和 Agent 统计 |
 | `POST` | `/chat` | 主对话入口 |
+| `POST` | `/auth/dev-token` | 仅 `APP_ENV=development` 时签发演示 JWT |
+| `POST` | `/access-requests/prepare` | JWT 认证后创建权限申请预览 |
+| `GET` | `/operations/{operation_id}` | JWT 认证后读取本人操作预览 |
+| `POST` | `/operations/{operation_id}/confirm` | JWT 与 `Idempotency-Key` 确认并执行 |
 | `GET` | `/search` | 执行增强 RAG 检索 |
 | `POST` | `/knowledge/add` | 批量导入 `{title, content}` 文档 |
 | `POST` | `/knowledge/upload` | 上传 `.txt`、`.md` 或 JSON 文档数组 |
@@ -335,7 +341,13 @@ Judge 的默认及格线为综合得分 0.75。由于 LLM Judge 本身可能与�
 | `GET` | `/monitor` | 返回 Agent、工具、告警和建议摘要 |
 | `GET` | `/metrics` | 暴露 Prometheus 指标 |
 
-`ChatResponse` 中的 `tool_calls` 用于审计本次回复中实际发生的工具使用；`knowledge_used` 表示预取 RAG 上下文是否成功构建；`execution_mode` 用于区分单任务、并行、串行、澄清或直接回复。
+`ChatResponse` 中的 `tool_calls` 是本次回复的工具调用轨迹；持久操作审计另存于 PostgreSQL。`knowledge_used` 表示预取 RAG 上下文是否成功构建；`execution_mode` 用于区分单任务、并行、串行、澄清或直接回复。报销对话还可返回 `pending_operation` 预览。
+
+### 10.1 人工确认操作与数据边界
+
+`SideEffectExecutor` 接受操作提案，调用适配器预检角色、参数与业务状态，构造只读预览，再把操作 ID、资源版本和快照哈希存入 PostgreSQL。提交时 JWT 中的 `sub` 必须是预览所有者；执行器以事务锁定操作和幂等键，校验预览未过期、状态仍待确认，再次预检并比对资源版本和快照。只有执行器可以授权 `submit_claim` 工具执行提交；相同幂等键重放已保存响应，冲突、失效和失败会记录审计事件。
+
+报销单经 `/chat` 的演示流程产生预览，但 `/chat` 本身未认证，不能将自然语言“确认”当作已认证提交。权限申请由已认证的 `/access-requests/prepare` 创建预览；确认后只写入本地演示工单，不调用 IAM。正常 FastAPI 生命周期下操作预览、幂等记录与审计事件使用 PostgreSQL 仓库，报销单与权限工单仍是进程内数据，进程重启不会保留业务记录。开发环境的 `/auth/dev-token` 只供本地演示，不是外部身份提供商。
 
 ## 11. 部署、配置与安全边界
 
@@ -344,7 +356,7 @@ Docker Compose 运行以下服务：
 ```text
 Nginx → EchoMind (FastAPI)
              ├─ Redis 7（AOF 持久化）
-             ├─ ChromaDB 0.5.23（持久化卷）
+             ├─ PostgreSQL/pgvector（持久化卷；向量与操作记录）
              └─ Prometheus
 ```
 
@@ -356,12 +368,14 @@ Nginx → EchoMind (FastAPI)
 | `ANTHROPIC_MODEL` | 模型名称 | `claude-3-5-sonnet-20241022` |
 | `ANTHROPIC_BASE_URL` | Anthropic 兼容服务地址 | 可选 |
 | `REDIS_URL` | Redis 连接地址 | Compose 中指向 `redis:6379/0` |
-| `CHROMA_HOST` / `CHROMA_PORT` | ChromaDB 地址 | Compose 中为 `chromadb:8000` |
+| `DATABASE_URL` / `DATABASE_URL_DOCKER` | PostgreSQL 连接地址 | 本地 / Compose 容器内连接串 |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSION` | 向量模型与维度 | `BAAI/bge-small-zh-v1.5` / `512` |
+| `JWT_SECRET_KEY` | 操作接口 JWT 签名密钥 | 部署时更换示例值 |
 | `MAX_TOOL_ROUNDS` | 单次 Agent 的最大工具调用轮数 | `5` |
 | `MONITOR_INTERVAL` | 监控采集间隔秒数 | `10` |
 | `ALERT_WEBHOOK_URL` | 告警 Webhook | 可选 |
 
-不要提交 `.env`、模型 Key、Redis 密码或企业敏感知识。当前 CORS 配置允许全部来源，真实企业部署前应收紧来源、接入鉴权、隔离租户，并对工具参数、日志和知识库内容实施审计与脱敏。
+不要提交 `.env`、模型 Key、数据库密码或企业敏感知识。当前 CORS 配置允许全部来源，且 `/chat` 与报销演示管理接口尚无 Bearer 鉴权；真实企业部署前应收紧来源并完善身份与访问控制、租户隔离以及敏感数据审计与脱敏。
 
 ## 12. 已知限制与后续改进方向
 
@@ -369,7 +383,7 @@ Nginx → EchoMind (FastAPI)
 2. 当前多 Agent 回复只做编号拼接，没有统一的语义汇总、冲突消解或跨 Agent 去重。
 3. 任务重叠只做原文字符串包含判断，尚未实现实体标准化或语义重叠识别。
 4. `account` 当前复用 GeneralAgent；如需独立的账号服务策略，应新增 AccountAgent 与对应工具权限。
-5. 长期 ChromaDB 数据没有保留期、归档、分区和容量压测策略。
+5. 长期 PostgreSQL 向量数据没有保留期、归档、分区和容量压测策略。
 6. RAG 的查询改写与 LLM 重排提高相关性，但会增加时延和模型成本；可引入简单查询分流、混合检索、轻量 reranker 与查询缓存。
 7. 现有评测以离线自建样本为主，尚不能代表真实员工流量、真实业务系统正确性或生产吞吐能力。
 

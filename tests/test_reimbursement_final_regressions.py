@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 from agents.agent_orchestrator import Request
 from core.reimbursement_models import ClaimState, ReimbursementAction, ReimbursementDecision
+from core.auth import Actor
+from core.operations import ActionProposal
 from tests.test_reimbursement_harness import HarnessTests, DecisionProvider, request
 from tests.test_reimbursement_orchestration import make_orchestrator, billing_task
 from core.task_planner import ExecutionMode, TaskPlan
@@ -84,7 +86,13 @@ class FinalSafetyTests(HarnessTests):
         owner = {"user_id": "emp-001", "conv_id": "conv-1"}
         reviewer = {"user_id": "manager-001", "conv_id": "conv-1"}
         finance = {"user_id": "finance-001", "conv_id": "conv-1"}
+        submit_preview = None
         async def call(name, extra, context):
+            if name == "submit_claim":
+                response = await self.harness.executor.confirm(
+                    Actor("emp-001", "employee"), submit_preview.operation_id, name,
+                )
+                return SimpleNamespace(success=True, data=response, error=None)
             return await self.manager.call(name, {"case_id": case.case_id,
                 "idempotency_key": name, **extra}, context, caller_agent="billing", use_cache=False)
         writes = [
@@ -97,6 +105,12 @@ class FinalSafetyTests(HarnessTests):
         ]
         originals = []
         for name, extra, context in writes:
+            if name == "submit_claim":
+                # The write race is exercised through the only authorized submit path.
+                submit_preview = await self.harness.executor.prepare(
+                    Actor("emp-001", "employee"),
+                    ActionProposal("reimbursement_submit", {"case_id": case.case_id}),
+                )
             results = await asyncio.gather(*(call(name, extra, context) for _ in range(5)))
             self.assertTrue(all(r.success for r in results), (name, [r.error for r in results]))
             self.assertTrue(all(r.data == results[0].data for r in results))

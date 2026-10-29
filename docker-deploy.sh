@@ -199,8 +199,9 @@ backup_data() {
     docker-compose exec -T redis redis-cli SAVE
     docker cp echomind-redis:/data/dump.rdb "$backup_dir/"
 
-    # 备份 ChromaDB 数据
-    docker cp echomind-chromadb:/chroma/chroma "$backup_dir/"
+    # 备份 PostgreSQL（含 pgvector、知识库、记忆与操作审计记录）。
+    docker-compose exec -T postgres pg_dump --clean --if-exists \
+        -U "${POSTGRES_USER:-echomind}" "${POSTGRES_DB:-echomind}" > "$backup_dir/postgres.sql"
 
     # 备份配置
     cp .env "$backup_dir/"
@@ -234,9 +235,6 @@ restore_data() {
         # 恢复 Redis 数据
         docker cp "$backup_dir/dump.rdb" echomind-redis:/data/
 
-        # 恢复 ChromaDB 数据
-        docker cp "$backup_dir/chroma" echomind-chromadb:/chroma/
-
         # 恢复配置
         cp "$backup_dir/.env" .env
         rm -rf config
@@ -244,6 +242,10 @@ restore_data() {
 
         # 启动服务
         docker-compose start
+
+        # PostgreSQL 必须运行后再导入；备份文件由 pg_dump --clean 生成。
+        docker-compose exec -T postgres psql -v ON_ERROR_STOP=1 \
+            -U "${POSTGRES_USER:-echomind}" -d "${POSTGRES_DB:-echomind}" < "$backup_dir/postgres.sql"
 
         print_info "恢复完成"
     else

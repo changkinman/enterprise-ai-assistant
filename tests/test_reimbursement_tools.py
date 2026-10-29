@@ -22,7 +22,13 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
         discover_agent_tools(self.manager, dependencies={"reimbursement_repository": self.repo})
 
     async def call(self, name, params, context=None, agent="billing"):
-        return await self.manager.call(name, params, context or CONTEXT, caller_agent=agent)
+        trusted_context = dict(context or CONTEXT)
+        if name == "submit_claim":
+            case = await self.repo.get_case(params["case_id"])
+            trusted_context.setdefault("expected_case_version", case.version)
+            trusted_context.setdefault("expected_material_version", case.material_version)
+        return await self.manager.call(name, params, trusted_context, caller_agent=agent,
+                                       executor_authorized=name == "submit_claim")
 
     async def ready_case(self, expenses=None):
         case = await self.repo.get_or_create_active_case("emp-001", "conv-1")
@@ -263,7 +269,10 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(validation.data["valid"])
                 self.assertIn("invalid_amount", [issue["code"] for issue in validation.data["issues"]])
                 submission = await manager.call("submit_claim", {"case_id": case.case_id, "idempotency_key": "x"},
-                                                {**CONTEXT, "confirmed": True}, caller_agent="billing")
+                                                {**CONTEXT, "confirmed": True,
+                                                 "expected_case_version": case.version,
+                                                 "expected_material_version": case.material_version},
+                                                caller_agent="billing", executor_authorized=True)
                 self.assertFalse(submission.success)
                 self.assertTrue(math.isfinite(await repo.remaining_budget("engineering")))
                 self.assertEqual(await repo.remaining_budget("engineering"), 3000.0)
@@ -274,7 +283,9 @@ class ReimbursementToolsTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(amount=amount):
                 with self.assertRaises(ValueError):
                     await self.repo.submit_claim(case.case_id, str(amount), "emp-001", "conv-1",
-                                                 lambda _: {"valid": True, "required_budget": amount})
+                                                 lambda _: {"valid": True, "required_budget": amount},
+                                                 expected_case_version=case.version,
+                                                 expected_material_version=case.material_version)
                 self.assertEqual(await self.repo.remaining_budget("engineering"), 3000.0)
 
 

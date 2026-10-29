@@ -10,7 +10,7 @@ import os
 import pathlib
 import sys
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 # 将项目根目录加入 sys.path，确保无论从哪里执行都能找到 agents/core/memory 等模块
@@ -21,10 +21,12 @@ if _ROOT not in sys.path:
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Response, UploadFile, File
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
+from core.auth import Actor, get_current_actor
+from core.operations import OperationPreview
 
 load_dotenv()
 
@@ -50,6 +52,7 @@ _tool_manager = None
 _monitor      = None
 _evaluator    = None
 _reimbursement_harness = None
+_side_effect_executor = None
 
 
 def _anthropic_cfg() -> Dict[str, Any]:
@@ -68,12 +71,15 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _reimbursement_harness
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _reimbursement_harness, _side_effect_executor
 
     print(BANNER, flush=True)
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
+    from core.database import Database
+    from core.embeddings import SentenceTransformerEmbeddingProvider
     from core.intent_recognizer import IntentRecognizer
+    from core.vector_store import VectorStore
     from evaluation.evaluator import EndToEndEvaluator
     from mcp.knowledge_base import KnowledgeBase
     from mcp.tool_manager import MCPToolManager, Tool
@@ -83,111 +89,121 @@ async def lifespan(app: FastAPI):
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
+    async with AsyncExitStack() as cleanup:
+        database = Database()
+        await database.connect()
+        cleanup.push_async_callback(database.close)
+        vector_store = VectorStore(database, SentenceTransformerEmbeddingProvider(database.settings))
 
-    # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
-    recognizer = IntentRecognizer(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-    )
+        # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
+        recognizer = IntentRecognizer(
+            api_key=cfg["api_key"],
+            base_url=cfg.get("base_url"),
+            model=cfg["model"],
+        )
 
-    # 记忆管理器（Redis 工作记忆 + ChromaDB 情景记忆/用户画像）
-    _memory = MemoryManager(
-        redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
-        chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-    )
+        # 记忆管理器（Redis 工作记忆 + PostgreSQL 情景记忆/用户画像）
+        _memory = MemoryManager(
+            redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
+            vector_store=vector_store,
+            api_key=cfg["api_key"],
+            base_url=cfg.get("base_url"),
+            model=cfg["model"],
+        )
 
-    # MCP 工具管理器 + RAG 知识库（基于 ChromaDB 的真实检索）
-    _tool_manager = MCPToolManager(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-    )
-    kb = KnowledgeBase(
-        chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
-    )
-    logger.info(f"知识库已加载: {kb.doc_count} 个文档片段")
+        # MCP 工具管理器 + RAG 知识库
+        _tool_manager = MCPToolManager(
+            api_key=cfg["api_key"],
+            base_url=cfg.get("base_url"),
+            model=cfg["model"],
+        )
+        kb = KnowledgeBase(vector_store)
+        await kb.ensure_default_documents()
+        logger.info("知识库已加载: %s 个文档片段", await kb.doc_count())
 
-    def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
-        query = params.get("query", "")
-        return [{
-            "title": "知识库降级结果",
-            "content": f"知识库暂时不可用，未能完成对“{query}”的语义检索。请稍后重试，或转人工客服确认。",
-            "score": 0.0,
-            "fallback": True,
-            "error": error,
-        }]
+        def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
+            query = params.get("query", "")
+            return [{
+                "title": "知识库降级结果",
+                "content": f"知识库暂时不可用，未能完成对“{query}”的语义检索。请稍后重试，或转人工客服确认。",
+                "score": 0.0,
+                "fallback": True,
+                "error": error,
+            }]
 
-    _tool_manager.register(Tool(
-        name="knowledge_search",
-        description="搜索知识库（基于 ChromaDB 向量检索）",
-        handler=kb.search_handler,
-        schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "top_k": {"type": "integer"},
+        _tool_manager.register(Tool(
+            name="knowledge_search",
+            description="搜索知识库（基于 pgvector 向量检索）",
+            handler=kb.search_handler,
+            schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "top_k": {"type": "integer"},
+                },
+                "required": ["query"],
             },
-            "required": ["query"],
-        },
-        cache_ttl=300.0,
-        supports_rerank=True,
-        fallback=knowledge_fallback,
-    ))
+            cache_ttl=300.0,
+            supports_rerank=True,
+            fallback=knowledge_fallback,
+        ))
 
-    from core.reimbursement_repository import InMemoryReimbursementRepository
-    from core.reimbursement_harness import ReimbursementCaseHarness
+        from core.reimbursement_repository import InMemoryReimbursementRepository
+        from core.reimbursement_harness import ReimbursementCaseHarness
+        from core.reimbursement_operation import ReimbursementSubmitOperation
+        from core.access_request import AccessRequestOperation, InMemoryAccessRequestStore
+        from core.operation_repository import PostgresOperationRepository
+        from core.side_effect_executor import SideEffectExecutor
 
-    reimbursement_repository = InMemoryReimbursementRepository()
-    agent_tool_names = discover_agent_tools(
-        _tool_manager, dependencies={"reimbursement_repository": reimbursement_repository}
-    )
-    _reimbursement_harness = ReimbursementCaseHarness(reimbursement_repository, _tool_manager)
-    logger.info(f"Agent 工具已加载: {agent_tool_names}")
+        reimbursement_repository = InMemoryReimbursementRepository()
+        agent_tool_names = discover_agent_tools(
+            _tool_manager, dependencies={"reimbursement_repository": reimbursement_repository}
+        )
+        _side_effect_executor = SideEffectExecutor(
+            PostgresOperationRepository(database),
+            {"reimbursement_submit": ReimbursementSubmitOperation(reimbursement_repository, _tool_manager),
+             "access_request": AccessRequestOperation(InMemoryAccessRequestStore())},
+        )
+        _reimbursement_harness = ReimbursementCaseHarness(
+            reimbursement_repository, _tool_manager, executor=_side_effect_executor,
+        )
+        logger.info(f"Agent 工具已加载: {agent_tool_names}")
 
-    # Agent 编排器在工具注册完成后创建，确保所有 Agent 取得完整工具目录。
-    _orchestrator = AgentOrchestrator(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-        tool_manager=_tool_manager,
-        reimbursement_harness=_reimbursement_harness,
-        max_tool_rounds=int(os.getenv("MAX_TOOL_ROUNDS", "5")),
-    )
-    # 性能监控（可选启动 Prometheus）
-    prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
-    _monitor = PerformanceMonitor(
-        orchestrator=_orchestrator,
-        tool_manager=_tool_manager,
-        interval_s=float(os.getenv("MONITOR_INTERVAL", "10")),
-        webhook_url=os.getenv("ALERT_WEBHOOK_URL") or None,
-        prometheus_port=prom_port,
-    )
-    await _monitor.start()
+        # Agent 编排器在工具注册完成后创建，确保所有 Agent 取得完整工具目录。
+        _orchestrator = AgentOrchestrator(
+            api_key=cfg["api_key"],
+            base_url=cfg.get("base_url"),
+            model=cfg["model"],
+            tool_manager=_tool_manager,
+            reimbursement_harness=_reimbursement_harness,
+            max_tool_rounds=int(os.getenv("MAX_TOOL_ROUNDS", "5")),
+        )
+        # 性能监控（可选启动 Prometheus）
+        prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
+        _monitor = PerformanceMonitor(
+            orchestrator=_orchestrator,
+            tool_manager=_tool_manager,
+            interval_s=float(os.getenv("MONITOR_INTERVAL", "10")),
+            webhook_url=os.getenv("ALERT_WEBHOOK_URL") or None,
+            prometheus_port=prom_port,
+        )
+        await _monitor.start()
+        cleanup.push_async_callback(_monitor.stop)
 
-    # 评测器
-    _evaluator = EndToEndEvaluator(
-        orchestrator=_orchestrator,
-        recognizer=recognizer,
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-        baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
-    )
+        # 评测器
+        _evaluator = EndToEndEvaluator(
+            orchestrator=_orchestrator,
+            recognizer=recognizer,
+            api_key=cfg["api_key"],
+            base_url=cfg.get("base_url"),
+            model=cfg["model"],
+            baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
+        )
 
-    logger.info("EchoMind 已就绪")
-    yield
+        logger.info("EchoMind 已就绪")
+        yield
 
-    await _monitor.stop()
     logger.info("EchoMind 已关闭")
-
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -233,6 +249,7 @@ class ChatResponse(BaseModel):
     knowledge_used: bool = False
     tool_calls: List[ToolCallResponse] = Field(default_factory=list)
     execution_mode: str = "single"
+    pending_operation: Optional[OperationPreview] = None
 
 
 class ReviewInput(BaseModel):
@@ -245,7 +262,97 @@ class PaymentInput(BaseModel):
     finance_user_id: str
 
 
+class AccessRequestInput(BaseModel):
+    system_name: str
+    permission: str
+    reason: str
+
+
+class DevTokenInput(BaseModel):
+    actor_id: str
+    role: str
+
+
+def _operation_executor():
+    if _side_effect_executor is None:
+        raise HTTPException(503, "服务未就绪")
+    return _side_effect_executor
+
+
+async def _operation_not_found_or_forbidden(executor, operation_id: str, actor) -> None:
+    owner_id = await executor.repository.get_owner_id(operation_id)
+    if owner_id is not None and owner_id != actor.id:
+        raise HTTPException(403, "无权访问该操作")
+    raise HTTPException(404, "操作不存在")
+
+
 # ── 路由 ──────────────────────────────────────────────────────────────────────
+@app.post("/auth/dev-token")
+async def issue_dev_token(request: Request):
+    from core.auth import Actor, AuthenticationError, create_dev_access_token
+
+    if os.environ.get("APP_ENV") != "development":
+        raise HTTPException(404, "Not found")
+    try:
+        body = DevTokenInput.model_validate(await request.json())
+    except ValueError as exc:
+        raise HTTPException(422, "Invalid actor") from exc
+    if not body.actor_id.strip() or body.role not in {"employee", "manager"}:
+        raise HTTPException(422, "Invalid actor")
+    try:
+        return {"access_token": create_dev_access_token(Actor(body.actor_id, body.role)),
+                "token_type": "bearer"}
+    except AuthenticationError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.post("/access-requests/prepare")
+async def prepare_access_request(body: AccessRequestInput,
+                                 actor: Actor = Depends(get_current_actor)):
+    from core.operations import ActionProposal, ValidationRejected
+
+    executor = _operation_executor()
+    try:
+        return await executor.prepare(actor, ActionProposal("access_request", body.model_dump()))
+    except ValidationRejected as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/operations/{operation_id}")
+async def get_operation(operation_id: str,
+                        actor: Actor = Depends(get_current_actor)):
+    from core.operations import OperationNotFound
+
+    executor = _operation_executor()
+    try:
+        return await executor.get_preview(actor, operation_id)
+    except OperationNotFound:
+        await _operation_not_found_or_forbidden(executor, operation_id, actor)
+
+
+@app.post("/operations/{operation_id}/confirm")
+async def confirm_operation(
+    operation_id: str,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    actor: Actor = Depends(get_current_actor),
+):
+    from core.operations import (
+        IdempotencyConflict, OperationExpired, OperationNotFound,
+        OperationStateConflict, OperationVersionConflict, ValidationRejected,
+    )
+
+    executor = _operation_executor()
+    try:
+        return await executor.confirm(actor, operation_id, idempotency_key)
+    except OperationNotFound:
+        await _operation_not_found_or_forbidden(executor, operation_id, actor)
+    except (OperationExpired, OperationStateConflict, OperationVersionConflict,
+            IdempotencyConflict, ValidationRejected) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.get("/reimbursements/{case_id}")
 async def get_reimbursement_case(case_id: str):
     if _reimbursement_harness is None:
@@ -358,6 +465,7 @@ async def chat(req: ChatRequest):
         latency_ms=round(result.latency_ms, 1),
         knowledge_used=knowledge_used,
         execution_mode=result.execution_mode,
+        pending_operation=result.pending_operation,
         tool_calls=[
             ToolCallResponse(**{
                 "round": trace.round,
@@ -490,7 +598,7 @@ async def add_knowledge(body: BatchDocInput):
     """
     批量导入文档到知识库。
 
-    文档会自动切片（每片 500 字）并存入 ChromaDB，ChromaDB 内置 Embedding 模型自动向量化。
+    文档会自动切片（每片 500 字），由显式 Embedding 模型向量化并存入 PostgreSQL。
 
     示例请求体：
     ```json
@@ -506,8 +614,8 @@ async def add_knowledge(body: BatchDocInput):
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    count = kb.add_documents([{"title": d.title, "content": d.content} for d in body.documents])
-    return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": kb.doc_count}
+    count = await kb.add_documents([{"title": d.title, "content": d.content} for d in body.documents])
+    return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": await kb.doc_count()}
 
 
 @app.post("/knowledge/upload", tags=["知识库"])
@@ -546,11 +654,11 @@ async def upload_knowledge(file: UploadFile = File(...)):
         title = filename.rsplit(".", 1)[0] if "." in filename else filename
         docs = [{"title": title, "content": text}]
 
-    count = kb.add_documents(docs)
+    count = await kb.add_documents(docs)
     return {
         "message": f"文件 {filename} 导入成功",
         "added_chunks": count,
-        "total_chunks": kb.doc_count,
+        "total_chunks": await kb.doc_count(),
     }
 
 
@@ -561,7 +669,7 @@ async def knowledge_stats():
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    return {"total_chunks": kb.doc_count}
+    return {"total_chunks": await kb.doc_count()}
 
 
 @app.post("/eval/run")
@@ -621,11 +729,17 @@ async def _cli():
     print("EchoMind CLI — 输入 quit 退出\n")
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
+    from core.database import Database
+    from core.embeddings import SentenceTransformerEmbeddingProvider
+    from core.vector_store import VectorStore
     from memory.conversation_memory import MemoryManager, MsgRole
     from mcp.tool_manager import MCPToolManager
     from tools.loader import discover_agent_tools
 
     cfg = _anthropic_cfg()
+    database = Database()
+    await database.connect()
+    vector_store = VectorStore(database, SentenceTransformerEmbeddingProvider(database.settings))
     tool_manager = MCPToolManager(
         api_key=cfg["api_key"], base_url=cfg.get("base_url"), model=cfg["model"]
     )
@@ -639,9 +753,7 @@ async def _cli():
     )
     mem  = MemoryManager(
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
-        chroma_host=os.getenv("CHROMA_HOST", "localhost"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/tmp/chroma"),
+        vector_store=vector_store,
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
@@ -671,6 +783,8 @@ async def _cli():
         await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
         print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
+
+    await database.close()
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ from copy import deepcopy
 from typing import Any, Callable
 from uuid import uuid4
 
-from core.reimbursement_models import ClaimState, ReimbursementCase
+from core.reimbursement_models import ClaimState, ReimbursementCase, append_event
 
 
 ENGINEERING_BUDGET = 100_000.0
@@ -68,10 +68,19 @@ class InMemoryReimbursementRepository:
         async with self._lock:
             stored = self._cases.get(case.case_id)
             saved = deepcopy(case)
+            if (stored is not None and case.version < stored.version
+                    and stored.state in {ClaimState.SUBMITTED, ClaimState.PAID}
+                    and case.state == ClaimState.AWAITING_CONFIRMATION):
+                # A status/event write may have waited while confirmation committed.
+                # Keep the newer business state and add only events from that write.
+                saved = deepcopy(stored)
+                saved.events.extend(event for event in case.events if event not in stored.events)
             if stored is None:
                 # A caller-created case starts at its supplied pre-save version.
                 saved.version = case.version + 1
             else:
+                saved.material_version = stored.material_version + int(
+                    saved.facts != stored.facts or saved.expenses != stored.expenses)
                 saved.version = stored.version
                 changed = saved != stored
                 saved.version = stored.version + int(changed)
@@ -104,6 +113,7 @@ class InMemoryReimbursementRepository:
         user_id: str,
         conv_id: str,
         validator: Callable[[ReimbursementCase], dict[str, Any]],
+        *, expected_case_version: int, expected_material_version: int,
     ) -> dict[str, Any]:
         """Validate and submit under one lock so budget and idempotency cannot race."""
         async with self._lock:
@@ -128,6 +138,9 @@ class InMemoryReimbursementRepository:
                 raise ValueError("部门预算数据无效")
             if available < amount:
                 raise ValueError("部门预算不足")
+            if (case.version != expected_case_version
+                    or case.material_version != expected_material_version):
+                raise ValueError("报销单预览已过期")
             self._budgets[case.department] = available - amount
             self._reserved_amounts[case.case_id] = amount
             case.claim_no = f"CLM-{uuid4().hex[:12].upper()}"
@@ -135,6 +148,9 @@ class InMemoryReimbursementRepository:
             case.validation = deepcopy(validation)
             case.state = ClaimState.SUBMITTED
             case.version += 1
+            append_event(case, "state_transition", {"from": ClaimState.AWAITING_CONFIRMATION.value,
+                                                    "to": ClaimState.SUBMITTED.value,
+                                                    "reason": "submit_claim"})
             result = {"case_id": case.case_id, "claim_no": case.claim_no,
                       "state": case.state.value, "total_amount": amount,
                       "budget_reserved": True}
@@ -160,6 +176,8 @@ class InMemoryReimbursementRepository:
                 return deepcopy(self._write_results[key])
             case = deepcopy(stored)
             result = mutate(case)
+            case.material_version = stored.material_version + int(
+                case.facts != stored.facts or case.expenses != stored.expenses)
             case.version = stored.version + int(case != stored)
             self._cases[case_id] = case
             self._write_payloads[key] = deepcopy(payload)
