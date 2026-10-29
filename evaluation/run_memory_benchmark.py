@@ -1,8 +1,8 @@
 """三级记忆基准：工作记忆、跨会话情景记忆、摘要压缩、用户隔离与画像。
 
-该脚本使用独立的 Redis key 前缀和 Chroma collection；结束时仅删除本次
-创建的 collection 与 key，不会触碰项目业务记忆。运行前需要可用的 Redis、
-ChromaDB 与模型配置。
+旧版脚本直接使用 Chroma collection。运行时已迁移到 PostgreSQL/pgvector，
+因此本入口被保留为明确的迁移提示：基准需要隔离的 PostgreSQL 和 Redis，
+不会由脚本隐式创建或清理。
 """
 import asyncio
 import json
@@ -13,7 +13,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import chromadb
 
 from memory.conversation_memory import MemoryManager, MsgRole
 
@@ -194,11 +193,10 @@ class MemoryBenchmark:
 
 
 async def main() -> None:
-    benchmark = MemoryBenchmark()
-    try:
-        print(json.dumps(await benchmark.evaluate(), ensure_ascii=False), flush=True)
-    finally:
-        benchmark.cleanup()
+    raise RuntimeError(
+        "Memory benchmark needs an isolated PostgreSQL/pgvector + Redis environment; "
+        "the legacy Chroma benchmark is retired."
+    )
 
 
 if __name__ == "__main__":
